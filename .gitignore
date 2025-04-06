@@ -1,0 +1,4 @@
+/src/outputs*
+/src/__pycache__
+/src/wandb
+README.md
