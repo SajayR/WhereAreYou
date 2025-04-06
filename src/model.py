@@ -330,7 +330,7 @@ class MultiModalModel(nn.Module):
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
-            return sim * torch.exp(self.temperature)
+            return sim * self.temperature
 
 
     ######################################################
@@ -351,7 +351,7 @@ class MultiModalModel(nn.Module):
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
         # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) * torch.exp(self.temperature)
+        token_sims = torch.matmul(tf, vf.transpose(2, 3)) * self.temperature
         # max over visual dimension => (B, B, Nt)
         max_sims = torch.max(token_sims, dim=3)[0]
         # we need masked mean over Nt
@@ -391,7 +391,7 @@ class MultiModalModel(nn.Module):
         reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
 
         #temp constraints
-        temp = torch.exp(self.temperature)
+        temp = self.temperature
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
                                - torch.log(temp), min=0) ** 2
         #temp_high = torch.clamp(torch.log(temp) 
