@@ -2,3 +2,8 @@
 /src/__pycache__
 /src/wandb
 README.md
+src/ms_coco_batched_ret.py
+src/ms_coco_ret.py
+/useless/
+.gitignore
+results.txt

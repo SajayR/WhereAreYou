@@ -575,7 +575,8 @@ class MultiModalTrainer:
     def train(self):
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
-            self.eval_1000_way_retrieval()
+            #self.eval_1000_way_retrieval()
+            self.visualize_samples(epoch)
             phase = "text"
             self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Training")
             self.logger.info(f"Epoch {epoch} starting")
