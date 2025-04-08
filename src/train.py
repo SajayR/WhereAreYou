@@ -72,7 +72,11 @@ class MultiModalTrainer:
         use_amp: bool = True,
         # Validation parameters
         text_dataset_val_path: str = None,
-        validation_frequency: int = 10000  # Run validation every N steps
+        validation_frequency: int = 10000,  # Run validation every N steps
+        # New temperature scheduling parameters
+        aggregator_temp_start: float = 4.0,
+        aggregator_temp_end: float = 0.1,
+        aggregator_temp_steps: int = 150000,
     ):
         """
         Args:
@@ -106,6 +110,10 @@ class MultiModalTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.validation_frequency = validation_frequency
 
+        self.aggregator_temp_start = aggregator_temp_start
+        self.aggregator_temp_end = aggregator_temp_end
+        self.aggregator_temp_steps = aggregator_temp_steps
+
         self.config = {
             "batch_size_tv": batch_size_tv,
             "learning_rate": learning_rate,
@@ -115,7 +123,10 @@ class MultiModalTrainer:
             "unfreeze_vit_step": unfreeze_vit_step,
             "vis_every": vis_every,
             "save_every_steps": save_every_steps,
-            "validation_frequency": validation_frequency
+            "validation_frequency": validation_frequency,
+            "aggregator_temp_start": aggregator_temp_start,
+            "aggregator_temp_end": aggregator_temp_end,
+            "aggregator_temp_steps": aggregator_temp_steps
         }
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
@@ -183,7 +194,8 @@ class MultiModalTrainer:
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.00,
             visual_dropout_prob=0.25,
-            use_amp=use_amp
+            use_amp=use_amp,
+            aggregator_temp=self.aggregator_temp_start
         ).to(self.device)
         #enabling gradient checkpointing
         #self.model.audio_embedder.hubert.gradient_checkpointing_enable()
@@ -293,7 +305,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-text-unnormalized-difftemp", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-text-logexp-null-patch", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -305,6 +317,31 @@ class MultiModalTrainer:
         self.model = torch.compile(self.model, mode="max-autotune")
 
         self.logger.info("Initialized MultiModalTrainer for text-visual training.")
+
+
+    def get_aggregator_temp(self, current_step):
+        """
+        Exponential schedule from aggregator_temp_start down to aggregator_temp_end.
+        
+        Args:
+            current_step: Current training step
+            
+        Returns:
+            Temperature value for the current step based on exponential decay
+        """
+        if current_step >= self.aggregator_temp_steps:
+            return self.aggregator_temp_end
+        
+        alpha = current_step / self.aggregator_temp_steps  # goes 0->1
+        # Exponential decay:
+        # T(step) = T_start * (T_end/T_start)^alpha
+        temp = self.aggregator_temp_start * (self.aggregator_temp_end / self.aggregator_temp_start) ** alpha
+        
+        # Log temperature changes periodically or at significant milestones
+        if current_step % 500 == 0 or alpha in [0.25, 0.5, 0.75]:
+            self.logger.info(f"Step {current_step}/{self.aggregator_temp_steps}: aggregator_temp = {temp:.4f}")
+            
+        return temp
 
 
     ###########################################
@@ -352,7 +389,10 @@ class MultiModalTrainer:
             "sched_step_vit": self.step_vit,
             "best_loss": self.best_loss,
             "config": self.config,
-            "vis_samples_tv": self.vis_samples_tv
+            "vis_samples_tv": self.vis_samples_tv,
+            "aggregator_temp_start": self.aggregator_temp_start,
+            "aggregator_temp_end": self.aggregator_temp_end,
+            "current_aggregator_temp": self.model.aggregator_temp if hasattr(self.model, "aggregator_temp") else None
         }
         torch.save(ckpt, ckpt_path)
         self.logger.info(f"Saved checkpoint: {ckpt_path}")
@@ -390,7 +430,22 @@ class MultiModalTrainer:
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"]
         self.current_batch_idx = ck.get("current_batch_idx", 0)
-        self.best_loss = ck["best_loss"]
+        self.best_loss = ck["best_loss"],
+        self.aggregator_temp_start = ck.get("aggregator_temp_start", self.aggregator_temp_start)
+        self.aggregator_temp_end = ck.get("aggregator_temp_end", self.aggregator_temp_end)
+        
+        # If the model has a temperature attribute, set it based on the checkpoint
+        # or calculate it based on the current step
+        if hasattr(self.model, "aggregator_temp"):
+            current_temp = ck.get("current_aggregator_temp")
+            if current_temp is not None:
+                self.model.aggregator_temp = current_temp
+            else:
+                # Calculate the temperature based on the current step
+                calculated_temp = self.get_aggregator_temp(self.global_step)
+                self.model.aggregator_temp = calculated_temp
+                self.logger.info(f"Setting aggregator_temp to {calculated_temp} based on step {self.global_step}")
+
         rng_state = ck.get("rng_state", None)
         if rng_state is not None:
             torch_state = rng_state["torch"]
@@ -596,6 +651,10 @@ class MultiModalTrainer:
 
             for batch_idx in pbar:
                 self._update_frozen_params(self.global_step)
+                current_temp = self.get_aggregator_temp(self.global_step)
+                if hasattr(self.model, "aggregator_temp"):
+                    self.model.aggregator_temp = current_temp
+
                 grad_norm_others = None
                 grad_norm_text = None
                 grad_norm_vit = None
@@ -672,7 +731,8 @@ class MultiModalTrainer:
                         "lr_others": self.opt_others.param_groups[0]['lr'],
                         "lr_text": self.opt_text.param_groups[0]['lr'],
                         "lr_vit": self.opt_vit.param_groups[0]['lr'],
-                        "temperature": self.model.temperature.item(),
+                        #"temperature": self.model.temperature.item(),
+                        "aggregator_temp": self.model.aggregator_temp
                     }
                     if grad_norm_others is not None:
                         wandb_dict["grad_norm_others"] = grad_norm_others.item()
@@ -680,6 +740,7 @@ class MultiModalTrainer:
                         wandb_dict["grad_norm_text"] = grad_norm_text.item()
                     if grad_norm_vit is not None:
                         wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
+                    
 
                     wandb_dict.update(tv_sim_stats)
                     wandb.log(wandb_dict)
@@ -730,7 +791,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-unnormalized-difftemp",
+        output_dir="./outputs-logexp-null-patch",
         batch_size_tv=60,
         num_epochs=10,
         learning_rate=1e-4,
@@ -746,7 +807,10 @@ if __name__ == "__main__":
         project_name="TriadText",
         num_vis_samples_tv=60,
         use_amp=True,
-        validation_frequency=20000
+        validation_frequency=20000,
+        aggregator_temp_start=4.0,
+        aggregator_temp_end=0.001,
+        aggregator_temp_steps=39696
     )
 
     trainer.train()

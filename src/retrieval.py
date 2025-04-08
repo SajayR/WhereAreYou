@@ -62,12 +62,12 @@ def compute_recall_at_k(sim_matrix):
 # For Text->Visual retrieval:
 # --------------------------------------------------------------------------- #
 def aggregator_tv_t2v(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) *temperature   
+    token_sims = torch.matmul(t_feats, v_feats.t())# *temperature   
     max_sims = token_sims.max(dim=1).values
     return max_sims.mean().item()
 
 def aggregator_tv_v2t(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) * temperature
+    token_sims = torch.matmul(t_feats, v_feats.t())# * temperature
     max_sims = token_sims.max(dim=0).values
     return max_sims.mean().item()
 
@@ -133,7 +133,7 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     indices = select_subset_indices(dataset, subset_file, subset_size=1000)
     text_feats_list, image_feats_list = embed_tv_subset(model, dataset, indices, device=device, batch_size=32)
     N = len(indices)
-    temperature = model.temperature#.item()
+    temperature = 1.0 #model.temperature#.item()
 
     # T->V
     print(f"Computing T->V retrieval on {N} items ...")

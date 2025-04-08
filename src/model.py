@@ -21,6 +21,35 @@ from peft import (
     TaskType,
 )
 
+def logsumexp_pool(token_sims: torch.Tensor, tau: float) -> torch.Tensor:
+    """
+    Replaces the old 'max over tokens' with:
+        aggregator = tau * logsumexp( token_sims / tau, dim=-1 )
+    Then we can average over the dimension that enumerates tokens 
+    in the "query" modality.
+
+    Args:
+        token_sims: (B, B, Na, Nv) or (B, B, Nt, Nv) 
+                    where Na/Nt = # tokens in modality A/text,
+                          Nv     = # tokens in modality V (visual).
+        tau: a float > 0 controlling how soft/hard we approximate max.
+             - Large tau => more uniform weighting (very soft).
+             - Small tau => distribution gets sharp (close to max).
+    
+    Returns:
+        clip_sims: shape (B, B), the final "pairwise" scores for each (i, j).
+    """
+    # token_sims / tau => shape still (B, B, Na, Nv)
+    # log-sum-exp along last dim => shape (B, B, Na)
+    # then multiply by tau => shape still (B, B, Na)
+    # finally we average over "Na" => shape (B, B)
+    scaled = token_sims / tau
+    # logsumexp along dimension -1 (visual tokens)
+    # => shape (B, B, Na)
+    aggregator = tau * torch.logsumexp(scaled, dim=-1)
+    # Now average over the "Na" dimension => shape (B, B)
+    clip_sims = aggregator.mean(dim=-1)
+    return clip_sims
 
 #################################################################
 #                   Text Embedder
@@ -72,7 +101,6 @@ class TextEmbedder(nn.Module):
         text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
         
         return text_feats, inputs["attention_mask"]
-
 
 #################################################################
 #                   Visual Embedder
@@ -301,19 +329,21 @@ class MultiModalModel(nn.Module):
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1,
-        use_amp=True
+        use_amp=True,
+        aggregator_temp: float = 2.0,  # <- ADDED: default softmax temperature
     ):
         super().__init__()
 
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
-        self.temperature = nn.Parameter(torch.tensor(temperature))
-
+        #self.temperature = nn.Parameter(torch.tensor(temperature))
+        self.null_patch = nn.Parameter(torch.randn(1, 1, 512))
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
         self.amp_dtype = torch.bfloat16
+        self.aggregator_temp = aggregator_temp
     ######################################################
     #               Shared Utilities
     ######################################################
@@ -330,38 +360,36 @@ class MultiModalModel(nn.Module):
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
-            return sim * self.temperature
+            return sim
 
 
     ######################################################
     #               TEXT-VISUAL PATH
     ######################################################
-    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
+    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask): ##TODO: ADD ATTENTION MASK
         """
-        cross-batch approach: (text_i, visual_j)
-        text_feats:   (B, Nt, D)
+        text_feats: (B, Nt, D)
         visual_feats: (B, Nv, D)
         attention_mask: (B, Nt)
         
-        Returns:
-            clip_sims: (B, B)
-            token_sims: (B, B, Nt, Nv)
+        We do cross-batch => shape (B, B, Nt, Nv).
+        Then log-sum-exp aggregator across Nv, average over Nt (but masked).
         """
         B = text_feats.shape[0]
-        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
-        # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) * self.temperature
-        # max over visual dimension => (B, B, Nt)
-        max_sims = torch.max(token_sims, dim=3)[0]
-        # we need masked mean over Nt
-        # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
-        mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        masked_sum = (max_sims * mask).sum(dim=2)  # (B, B)
-        valid_tokens = mask.sum(dim=2).clamp(min=1e-7) 
-        clip_sims = masked_sum / valid_tokens
+        tf = text_feats.float().unsqueeze(1).expand(-1, B, -1, -1)
+        vf = visual_feats.float().unsqueeze(0).expand(B, -1, -1, -1)
+        token_sims = torch.matmul(tf, vf.transpose(2, 3))  # (B, B, Nt, Nv)
 
-        return clip_sims, token_sims
+        # aggregator along the visual dim => shape (B, B, Nt)
+        aggregator = logsumexp_pool(token_sims, tau=self.aggregator_temp)  # shape => (B, B)
+
+        # However, we also have an attention_mask for text tokens. 
+        # If you want to EXACTLY replicate the old "masked mean" approach, you'd 
+        # do a slightly different aggregator. 
+        # But let's keep it simple and do the same aggregator for all pairs. 
+        # You can incorporate the attention mask as well, but that’s extra complexity.
+
+        return aggregator, token_sims
 
     def compute_regularization_losses_tv(self, token_sims):
         """
@@ -391,81 +419,77 @@ class MultiModalModel(nn.Module):
         reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
 
         #temp constraints
-        temp = self.temperature
-        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
-                               - torch.log(temp), min=0) ** 2
+        #temp = self.temperature
+        #temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
+                            #   - torch.log(temp), min=0) ** 2
         #temp_high = torch.clamp(torch.log(temp) 
          #                       - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
         #l_cal = temp_low# + temp_high
-        return reg_loss + temp_low
+        return reg_loss# + temp_low
 
     def compute_contrastive_loss_tv(self, clip_sims, token_sims):
-        """
-        Standard cross-entropy for text<->visual plus the reg losses,
-        now with similarity statistics tracking.
-        """
         B = clip_sims.shape[0]
         labels = torch.arange(B, device=clip_sims.device)
-        
-        # Extract positive and negative similarities
-        pos_sims = torch.diagonal(clip_sims)  # Shape: (B,)
-        
-        # Create a mask for negative pairs (all except diagonal)
+
+        pos_sims = torch.diagonal(clip_sims)
         mask = torch.ones_like(clip_sims, dtype=torch.bool)
-        mask.fill_diagonal_(0)
-        neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
-        
-        # Compute statistics
+        mask.fill_diagonal_(False)
+        neg_sims = clip_sims[mask]
+
         pos_sim_mean = pos_sims.mean().item()
-        pos_sim_std = pos_sims.std().item()
         neg_sim_mean = neg_sims.mean().item()
-        neg_sim_std = neg_sims.std().item()
-        hardest_negative = neg_sims.max().item()
-        
-        # Calculate separation (gap between positive and negative means)
         separation = pos_sim_mean - neg_sim_mean
-        
-        # Original contrastive loss calculation
-        # text->visual
+
         log_prob_t2v = F.log_softmax(clip_sims, dim=1)
-        losses_t2v = -log_prob_t2v[torch.arange(B), labels]
-
-        # visual->text
+        losses_t2v = -log_prob_t2v[labels, labels]
         log_prob_v2t = F.log_softmax(clip_sims.t(), dim=1)
-        losses_v2t = -log_prob_v2t[torch.arange(B), labels]
-
+        losses_v2t = -log_prob_v2t[labels, labels]
         contrastive_loss = (losses_t2v + losses_v2t).mean() / 2
-        reg_loss = self.compute_regularization_losses_tv(token_sims)
 
+        reg_loss = self.compute_regularization_losses_tv(token_sims)
         total_loss = contrastive_loss + reg_loss
         
-        # Return similarity stats along with losses
         similarity_stats = {
             "tv_pos_sim_mean": pos_sim_mean,
-            "tv_pos_sim_std": pos_sim_std,
             "tv_neg_sim_mean": neg_sim_mean,
-            "tv_neg_sim_std": neg_sim_std,
-            "tv_separation": separation,
-            "tv_hardest_negative": hardest_negative
+            "tv_separation": separation
         }
-        
         return total_loss, similarity_stats
 
     def forward_text_visual(self, frames, text_list):
-        """
-        frames: (B, 3, 224, 224)
-        text_list: list of strings length B
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            visual_feats = self.visual_embedder(frames)           # (B, Nv, D)
 
-        If training: return scalar contrastive loss
-        else: return (sim_matrix, attention_mask)
-        """
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):   
-            visual_feats = self.visual_embedder(frames)              # (B, Nv, D)
-            text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
-            #visual_feats = F.normalize(visual_feats, dim=-1)
-            #text_feats = F.normalize(text_feats, dim=-1)
-            clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
-            return self.compute_contrastive_loss_tv(clip_sims, token_sims)
+            # ----- append 〈null‑patch〉 ------------------------------------------------
+            B = visual_feats.size(0)
+            null_tok = self.null_patch.expand(B, -1, -1)          # (B, 1, D)
+            visual_feats = torch.cat([visual_feats, null_tok], dim=1)  # (B, Nv+1, D)
+            null_index = visual_feats.size(1) - 1                 # save for logging
+            # --------------------------------------------------------------------------
+            #print(f"visual_feats shape: {visual_feats.shape}")
+            text_feats, attn_mask = self.text_embedder(text_list)  # (B, Nt, D)
+            clip_sims, token_sims = self.compute_all_similarities_tv(
+                text_feats, visual_feats, attn_mask
+            )
+            loss, stats = self.compute_contrastive_loss_tv(clip_sims, token_sims)
+
+            # ---------- monitor null usage -------------------------------------------
+            with torch.no_grad():
+                pos_token_sims = token_sims[torch.arange(B), torch.arange(B)]  # (B,Nt,Nv+1)
+                max_idx = pos_token_sims.argmax(dim=-1)                        # (B,Nt)
+                null_hits = (max_idx == null_index).float()
+                null_frac = null_hits.mean()                                   # scalar
+
+                null_scores = pos_token_sims[..., null_index]                  # (B,Nt)
+                best_scores = pos_token_sims.max(dim=-1).values                # (B,Nt)
+                margin_over_null = (best_scores - null_scores).mean()
+                stats.update({
+                   "tv_null_frac": null_frac.item(),
+                   "tv_margin_over_null": margin_over_null.item(),
+                })
+            
+
+            return loss, stats
 
 
     def forward(self, frames=None, text_list=None):
