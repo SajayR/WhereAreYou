@@ -62,12 +62,12 @@ def compute_recall_at_k(sim_matrix):
 # For Text->Visual retrieval:
 # --------------------------------------------------------------------------- #
 def aggregator_tv_t2v(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) * torch.exp(temperature)
+    token_sims = torch.matmul(t_feats, v_feats.t()) *temperature   
     max_sims = token_sims.max(dim=1).values
     return max_sims.mean().item()
 
 def aggregator_tv_v2t(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) * torch.exp(temperature)
+    token_sims = torch.matmul(t_feats, v_feats.t()) * temperature
     max_sims = token_sims.max(dim=0).values
     return max_sims.mean().item()
 
@@ -110,7 +110,8 @@ def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
             batch_images = batch_images.to(device)
             vfeats = model.visual_embedder(batch_images)  # (B, Nv, D)
             tfeats, attn_mask = model.text_embedder(batch_captions)  # (B, Nt, D), (B, Nt)
-
+            vfeats = F.normalize(vfeats, dim=1)
+            tfeats = F.normalize(tfeats, dim=1)
             B = vfeats.shape[0]
             for b in range(B):
                 # slice out valid tokens

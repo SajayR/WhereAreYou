@@ -181,7 +181,7 @@ class MultiModalTrainer:
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=1.5,
             patch_sparsity_threshold=0.80,
-            patch_sparsity_weight=0.01,
+            patch_sparsity_weight=0.00,
             visual_dropout_prob=0.25,
             use_amp=use_amp
         ).to(self.device)
@@ -293,7 +293,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-text-unnormalized", config=self.config)
+            wandb.init(project=self.project_name, name="Triad-text-unnormalized-difftemp", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -729,8 +729,8 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-unnormalized",
-        batch_size_tv=64,
+        output_dir="./outputs-unnormalized-difftemp",
+        batch_size_tv=60,
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,
@@ -743,7 +743,7 @@ if __name__ == "__main__":
         unfreeze_text_step=5000,
         unfreeze_vit_step=0,
         project_name="TriadText",
-        num_vis_samples_tv=64,
+        num_vis_samples_tv=60,
         use_amp=True,
         validation_frequency=20000
     )
