@@ -730,7 +730,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-unnormalized-difftemp",
+        output_dir="./outputs-null-patch",
         batch_size_tv=60,
         num_epochs=10,
         learning_rate=1e-4,

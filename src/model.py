@@ -307,9 +307,9 @@ class MultiModalModel(nn.Module):
 
         self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
+        self.null_patch = nn.Parameter(torch.randn(1, 1, 512) * 0.02)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
-
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
@@ -452,21 +452,40 @@ class MultiModalModel(nn.Module):
         return total_loss, similarity_stats
 
     def forward_text_visual(self, frames, text_list):
-        """
-        frames: (B, 3, 224, 224)
-        text_list: list of strings length B
+        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
+            visual_feats = self.visual_embedder(frames)           # (B, Nv, D)
 
-        If training: return scalar contrastive loss
-        else: return (sim_matrix, attention_mask)
-        """
-        with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):   
-            visual_feats = self.visual_embedder(frames)              # (B, Nv, D)
-            text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
-            #visual_feats = F.normalize(visual_feats, dim=-1)
-            #text_feats = F.normalize(text_feats, dim=-1)
-            clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
-            return self.compute_contrastive_loss_tv(clip_sims, token_sims)
+            # ----- append 〈null‑patch〉 ------------------------------------------------
+            B = visual_feats.size(0)
+            null_tok = self.null_patch.expand(B, -1, -1)          # (B, 1, D)
+            visual_feats = torch.cat([visual_feats, null_tok], dim=1)  # (B, Nv+1, D)
+            null_index = visual_feats.size(1) - 1                 # save for logging
+            # --------------------------------------------------------------------------
 
+            text_feats, attn_mask = self.text_embedder(text_list)  # (B, Nt, D)
+            clip_sims, token_sims = self.compute_all_similarities_tv(
+                text_feats, visual_feats, attn_mask
+            )
+            loss, stats = self.compute_contrastive_loss_tv(clip_sims, token_sims)
+
+            # ---------- monitor null usage -------------------------------------------
+            with torch.no_grad():
+                pos_token_sims = token_sims[torch.arange(B), torch.arange(B)]  # (B,Nt,Nv+1)
+                max_idx = pos_token_sims.argmax(dim=-1)                        # (B,Nt)
+                null_hits = (max_idx == null_index).float()
+                null_frac = null_hits.mean()                                   # scalar
+
+                null_scores = pos_token_sims[..., null_index]                  # (B,Nt)
+                best_scores = pos_token_sims.max(dim=-1).values                # (B,Nt)
+                margin_over_null = (best_scores - null_scores).mean()
+
+            stats.update({
+                "tv_null_frac": null_frac.item(),
+                "tv_margin_over_null": margin_over_null.item(),
+            })
+            
+
+            return loss, stats
 
     def forward(self, frames=None, text_list=None):
         assert frames is not None or text_list is not None, "At least one modality must be provided"
