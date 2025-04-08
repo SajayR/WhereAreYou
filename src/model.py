@@ -380,6 +380,7 @@ class MultiModalModel(nn.Module):
             positive_sims.append(token_sims[i, i])
         if len(positive_sims) == 0:
             return 0.15 * l_nonneg
+            
         positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
         # softmax over patches => (B, Nt, Nv)
         patch_probs = F.softmax(positive_sims, dim=-1)
