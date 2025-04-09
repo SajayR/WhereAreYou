@@ -21,34 +21,41 @@ from peft import (
     TaskType,
 )
 
-def logsumexp_pool(token_sims: torch.Tensor, tau: float) -> torch.Tensor:
+def logsumexp_pool(token_sims: torch.Tensor, tau: float, attention_mask: torch.Tensor = None) -> torch.Tensor:
     """
     Replaces the old 'max over tokens' with:
         aggregator = tau * logsumexp( token_sims / tau, dim=-1 )
-    Then we can average over the dimension that enumerates tokens 
-    in the "query" modality.
+    Then we do a masked average over the text tokens.
 
     Args:
-        token_sims: (B, B, Na, Nv) or (B, B, Nt, Nv) 
-                    where Na/Nt = # tokens in modality A/text,
-                          Nv     = # tokens in modality V (visual).
-        tau: a float > 0 controlling how soft/hard we approximate max.
-             - Large tau => more uniform weighting (very soft).
-             - Small tau => distribution gets sharp (close to max).
+        token_sims: (B, B, Nt, Nv) where Nt = # tokens in text, Nv = # tokens in visual
+        tau: a float > 0 controlling how soft/hard we approximate max
+        attention_mask: (B, Nt) mask for text tokens (1 for real tokens, 0 for padding)
     
     Returns:
         clip_sims: shape (B, B), the final "pairwise" scores for each (i, j).
     """
-    # token_sims / tau => shape still (B, B, Na, Nv)
-    # log-sum-exp along last dim => shape (B, B, Na)
-    # then multiply by tau => shape still (B, B, Na)
-    # finally we average over "Na" => shape (B, B)
     scaled = token_sims / tau
     # logsumexp along dimension -1 (visual tokens)
-    # => shape (B, B, Na)
+    # => shape (B, B, Nt)
     aggregator = tau * torch.logsumexp(scaled, dim=-1)
-    # Now average over the "Na" dimension => shape (B, B)
-    clip_sims = aggregator.mean(dim=-1)
+    
+    if attention_mask is not None:
+        # Expand attention_mask from (B, Nt) to (B, B, Nt)
+        mask = attention_mask.unsqueeze(1).expand(-1, token_sims.size(1), -1)
+        
+        # Apply mask before taking mean
+        masked_sum = (aggregator * mask).sum(dim=-1)  # shape (B, B)
+        
+        # Get number of valid tokens per pair (avoid div by zero)
+        token_counts = mask.sum(dim=-1).clamp(min=1.0)  # shape (B, B)
+        
+        # Compute masked mean
+        clip_sims = masked_sum / token_counts
+    else:
+        # If no mask provided, simply average over all tokens
+        clip_sims = aggregator.mean(dim=-1)
+    
     return clip_sims
 
 #################################################################
@@ -366,28 +373,14 @@ class MultiModalModel(nn.Module):
     ######################################################
     #               TEXT-VISUAL PATH
     ######################################################
-    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask): ##TODO: ADD ATTENTION MASK
-        """
-        text_feats: (B, Nt, D)
-        visual_feats: (B, Nv, D)
-        attention_mask: (B, Nt)
-        
-        We do cross-batch => shape (B, B, Nt, Nv).
-        Then log-sum-exp aggregator across Nv, average over Nt (but masked).
-        """
+    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
         B = text_feats.shape[0]
         tf = text_feats.float().unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.float().unsqueeze(0).expand(B, -1, -1, -1)
         token_sims = torch.matmul(tf, vf.transpose(2, 3))  # (B, B, Nt, Nv)
 
-        # aggregator along the visual dim => shape (B, B, Nt)
-        aggregator = logsumexp_pool(token_sims, tau=self.aggregator_temp)  # shape => (B, B)
-
-        # However, we also have an attention_mask for text tokens. 
-        # If you want to EXACTLY replicate the old "masked mean" approach, you'd 
-        # do a slightly different aggregator. 
-        # But let's keep it simple and do the same aggregator for all pairs. 
-        # You can incorporate the attention mask as well, but that’s extra complexity.
+        # Now properly using the attention mask
+        aggregator = logsumexp_pool(token_sims, tau=self.aggregator_temp, attention_mask=attention_mask)
 
         return aggregator, token_sims
 

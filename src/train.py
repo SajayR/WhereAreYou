@@ -77,6 +77,7 @@ class MultiModalTrainer:
         aggregator_temp_start: float = 4.0,
         aggregator_temp_end: float = 0.1,
         aggregator_temp_steps: int = 150000,
+        run_name: str = "baseline",
     ):
         """
         Args:
@@ -105,6 +106,7 @@ class MultiModalTrainer:
 
         self.use_wandb = use_wandb
         self.project_name = project_name
+        self.run_name = run_name
         self.vis_every = vis_every
         self.save_every_steps = save_every_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -126,7 +128,8 @@ class MultiModalTrainer:
             "validation_frequency": validation_frequency,
             "aggregator_temp_start": aggregator_temp_start,
             "aggregator_temp_end": aggregator_temp_end,
-            "aggregator_temp_steps": aggregator_temp_steps
+            "aggregator_temp_steps": aggregator_temp_steps,
+            "run_name": run_name
         }
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
@@ -305,7 +308,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-text-logexp-null-patch", config=self.config)
+            wandb.init(project=self.project_name, name=self.run_name, config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -791,7 +794,8 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-logexp-null-patch",
+        output_dir="./outputs-logexp-null-patch-correctedattnmask",
+        run_name="logexp-null-patch-corrected",
         batch_size_tv=60,
         num_epochs=10,
         learning_rate=1e-4,
@@ -810,7 +814,7 @@ if __name__ == "__main__":
         validation_frequency=20000,
         aggregator_temp_start=4.0,
         aggregator_temp_end=0.001,
-        aggregator_temp_steps=39696
+        aggregator_temp_steps=45000
     )
 
     trainer.train()
