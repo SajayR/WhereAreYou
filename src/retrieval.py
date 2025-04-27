@@ -109,7 +109,7 @@ def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
         for batch_images, batch_captions in tqdm(loader, desc="Embedding TV subset"):
             batch_images = batch_images.to(device)
             vfeats = model.visual_embedder(batch_images)  # (B, Nv, D)
-            tfeats, attn_mask = model.text_embedder(batch_captions)  # (B, Nt, D), (B, Nt)
+            tfeats, attn_mask, _ = model.text_embedder(batch_captions)  # (B, Nt, D), (B, Nt)
             vfeats = F.normalize(vfeats, dim=1)
             tfeats = F.normalize(tfeats, dim=1)
             B = vfeats.shape[0]

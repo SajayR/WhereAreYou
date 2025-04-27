@@ -78,6 +78,7 @@ class MultiModalTrainer:
         aggregator_temp_end: float = 0.1,
         aggregator_temp_steps: int = 150000,
         run_name: str = "baseline",
+        idf_path: str = None,
     ):
         """
         Args:
@@ -198,7 +199,8 @@ class MultiModalTrainer:
             patch_sparsity_weight=0.00,
             visual_dropout_prob=0.25,
             use_amp=use_amp,
-            aggregator_temp=self.aggregator_temp_start
+            aggregator_temp=self.aggregator_temp_start,
+            idf_path=idf_path
         ).to(self.device)
         #enabling gradient checkpointing
         #self.model.audio_embedder.hubert.gradient_checkpointing_enable()
@@ -634,7 +636,7 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             #self.eval_1000_way_retrieval()
-            self.visualize_samples(epoch)
+            #self.visualize_samples(epoch)
             phase = "text"
             self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Training")
             self.logger.info(f"Epoch {epoch} starting")
@@ -794,8 +796,8 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-logexp-null-patch-correctedattnmask",
-        run_name="logexp-null-patch-corrected",
+        output_dir="./outputs-logexp-null-patch-correctedattnmask-tfidf",
+        run_name="logexp-null-patch-corrected-tfidf",
         batch_size_tv=60,
         num_epochs=10,
         learning_rate=1e-4,
@@ -814,7 +816,8 @@ if __name__ == "__main__":
         validation_frequency=20000,
         aggregator_temp_start=4.0,
         aggregator_temp_end=0.001,
-        aggregator_temp_steps=45000
+        aggregator_temp_steps=45000,
+        idf_path="/home/cis/cc3m-ironic/idf.npy"
     )
 
     trainer.train()

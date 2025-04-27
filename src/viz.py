@@ -191,7 +191,7 @@ class TextVisualizer:
         model.eval()
         with torch.no_grad():
             vf = model.visual_embedder(frame.unsqueeze(0))
-            tf, mask = model.text_embedder([text])
+            tf, mask, _ = model.text_embedder([text])
             sims = model.compute_similarity_matrix(tf, vf).squeeze(0)[: int(mask.sum())]
 
         tokenizer = model.text_embedder.tokenizer

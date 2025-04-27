@@ -14,6 +14,7 @@ warnings.filterwarnings("ignore")
 import torchvision.transforms as transforms
 from PIL import Image
 from torch.cuda.amp import autocast
+import numpy as np
 
 from peft import (
     LoraConfig, 
@@ -21,7 +22,7 @@ from peft import (
     TaskType,
 )
 
-def logsumexp_pool(token_sims: torch.Tensor, tau: float, attention_mask: torch.Tensor = None) -> torch.Tensor:
+def logsumexp_pool(token_sims: torch.Tensor, tau: float, attention_mask: torch.Tensor = None, token_weights: torch.Tensor = None) -> torch.Tensor:
     """
     Replaces the old 'max over tokens' with:
         aggregator = tau * logsumexp( token_sims / tau, dim=-1 )
@@ -31,6 +32,7 @@ def logsumexp_pool(token_sims: torch.Tensor, tau: float, attention_mask: torch.T
         token_sims: (B, B, Nt, Nv) where Nt = # tokens in text, Nv = # tokens in visual
         tau: a float > 0 controlling how soft/hard we approximate max
         attention_mask: (B, Nt) mask for text tokens (1 for real tokens, 0 for padding)
+        token_weights: (B, Nt) (row-normalized TF-IDF). If None → uniform.
     
     Returns:
         clip_sims: shape (B, B), the final "pairwise" scores for each (i, j).
@@ -43,18 +45,24 @@ def logsumexp_pool(token_sims: torch.Tensor, tau: float, attention_mask: torch.T
     if attention_mask is not None:
         # Expand attention_mask from (B, Nt) to (B, B, Nt)
         mask = attention_mask.unsqueeze(1).expand(-1, token_sims.size(1), -1)
-        
-        # Apply mask before taking mean
-        masked_sum = (aggregator * mask).sum(dim=-1)  # shape (B, B)
-        
-        # Get number of valid tokens per pair (avoid div by zero)
-        token_counts = mask.sum(dim=-1).clamp(min=1.0)  # shape (B, B)
-        
-        # Compute masked mean
-        clip_sims = masked_sum / token_counts
+        aggregator = aggregator * mask
+    
+    if token_weights is not None:
+        # Expand token_weights from (B, Nt) to (B, B, Nt)
+        w = token_weights.unsqueeze(1).expand(-1, token_sims.size(1), -1)
+        weighted = (aggregator * w).sum(dim=-1)
+        denom = (w * (mask if attention_mask is not None else 1)).sum(dim=-1).clamp(min=1e-6)
+        clip_sims = weighted / denom
     else:
-        # If no mask provided, simply average over all tokens
-        clip_sims = aggregator.mean(dim=-1)
+        # If no weights provided, simply average over all tokens
+        if attention_mask is not None:
+            # Get number of valid tokens per pair (avoid div by zero)
+            token_counts = mask.sum(dim=-1).clamp(min=1.0)  # shape (B, B)
+            # Compute masked mean
+            clip_sims = aggregator.sum(dim=-1) / token_counts
+        else:
+            # If no mask provided, simply average over all tokens
+            clip_sims = aggregator.mean(dim=-1)
     
     return clip_sims
 
@@ -66,7 +74,7 @@ class TextEmbedder(nn.Module):
     pre-trained BERT-like model to extract text features.
     Projects them down to a desired embedding dimension.
     """
-    def __init__(self, embedding_dim=512, model_name="answerdotai/ModernBERT-base"):
+    def __init__(self, embedding_dim=512, model_name="answerdotai/ModernBERT-base", idf_path=None):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
@@ -75,12 +83,49 @@ class TextEmbedder(nn.Module):
         self.projection2 = nn.Linear(512, embedding_dim)
         print("Using text model: ", model_name)
         
+        # ---------------- TextEmbedder.__init__ ----------------
+        if idf_path is not None:
+            idf_np = np.load(idf_path).astype(np.float32)
+            self.register_buffer("idf", torch.from_numpy(idf_np), persistent=False)
+        else:
+            self.idf = None
+
+        print(f"IDF shape: {self.idf.shape}")
+        print("Tokenizer vocab size: ", self.tokenizer.vocab_size)
         for param in self.encoder.parameters():
             param.requires_grad = True
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
             param.requires_grad = True
+    
+    def _make_tfidf(self, input_ids, attention_mask):
+        """
+        input_ids      : (B, Nt)  Long
+        attention_mask : (B, Nt)  1/0
+        returns tfidf  : (B, Nt)  float32, row‑normalised (sum==1)
+        """
+        B, Nt = input_ids.shape
+        device = input_ids.device
+
+        idf_vec = torch.ones_like(input_ids, dtype=torch.float32) \
+                if self.idf is None else self.idf[input_ids]
+
+        tfidf = torch.zeros_like(idf_vec)
+
+        for b in range(B):
+            valid_pos = attention_mask[b] == 1
+            valid_ids = input_ids[b][valid_pos]
+            n_tokens  = valid_ids.numel()
+            if n_tokens == 0:
+                continue
+            vals, counts = valid_ids.unique(return_counts=True)
+            for v, c in zip(vals, counts):
+                tfidf[b, input_ids[b] == v] = (c.float() / n_tokens) * idf_vec[b, input_ids[b] == v]
+
+        tfidf = tfidf / (tfidf.sum(dim=-1, keepdim=True) + 1e-8)
+        tfidf = tfidf * attention_mask   # zero‑out pads exactly
+        return tfidf
         
     def forward(self, text_list):
         """
@@ -90,6 +135,7 @@ class TextEmbedder(nn.Module):
         Returns:
             text_feats: (B, Nt, D)
             attention_mask: (B, Nt)
+            tfidf_weights: (B, Nt) or None if IDF not provided
         """
         inputs = self.tokenizer(
             text_list, 
@@ -107,7 +153,10 @@ class TextEmbedder(nn.Module):
         hidden_states = outputs.last_hidden_state
         text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
         
-        return text_feats, inputs["attention_mask"]
+        # Calculate TF-IDF weights if IDF is available
+        tfidf_weights = self._make_tfidf(inputs["input_ids"], inputs["attention_mask"]) if self.idf is not None else None
+        
+        return text_feats, inputs["attention_mask"], tfidf_weights
 
 #################################################################
 #                   Visual Embedder
@@ -338,10 +387,11 @@ class MultiModalModel(nn.Module):
         visual_dropout_prob=0.1,
         use_amp=True,
         aggregator_temp: float = 2.0,  # <- ADDED: default softmax temperature
+        idf_path: str = None,          # <- ADDED: path to IDF table
     ):
         super().__init__()
 
-        self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
+        self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name, idf_path=idf_path)
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
         #self.temperature = nn.Parameter(torch.tensor(temperature))
@@ -373,14 +423,19 @@ class MultiModalModel(nn.Module):
     ######################################################
     #               TEXT-VISUAL PATH
     ######################################################
-    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
+    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask, tfidf_weights=None):
         B = text_feats.shape[0]
         tf = text_feats.float().unsqueeze(1).expand(-1, B, -1, -1)
         vf = visual_feats.float().unsqueeze(0).expand(B, -1, -1, -1)
         token_sims = torch.matmul(tf, vf.transpose(2, 3))  # (B, B, Nt, Nv)
 
-        # Now properly using the attention mask
-        aggregator = logsumexp_pool(token_sims, tau=self.aggregator_temp, attention_mask=attention_mask)
+        # Now properly using the attention mask and TF-IDF weights
+        aggregator = logsumexp_pool(
+            token_sims, 
+            tau=self.aggregator_temp, 
+            attention_mask=attention_mask,
+            token_weights=tfidf_weights
+        )
 
         return aggregator, token_sims
 
@@ -460,9 +515,9 @@ class MultiModalModel(nn.Module):
             null_index = visual_feats.size(1) - 1                 # save for logging
             # --------------------------------------------------------------------------
             #print(f"visual_feats shape: {visual_feats.shape}")
-            text_feats, attn_mask = self.text_embedder(text_list)  # (B, Nt, D)
+            text_feats, attn_mask, tfidf_weights = self.text_embedder(text_list)  # (B, Nt, D)
             clip_sims, token_sims = self.compute_all_similarities_tv(
-                text_feats, visual_feats, attn_mask
+                text_feats, visual_feats, attn_mask, tfidf_weights
             )
             loss, stats = self.compute_contrastive_loss_tv(clip_sims, token_sims)
 
@@ -488,7 +543,7 @@ class MultiModalModel(nn.Module):
     def forward(self, frames=None, text_list=None):
         assert frames is not None or text_list is not None, "At least one modality must be provided"
         # we need to conver the image into the correct format and shit
-        assert frames is not str, "Frames Cross-modal retrieval using 1000 evaluation videos from the PlacesAudio and AudioSet validation datasets. DenseAV dramatically outperforms all approaches tested in all metrics. Most notably, the state-of-the-art image retrieval foundation model, ImageBind, is incapable of recognizing speech. We note that the ImageBind authors do not publish retraining code, so we evaluate their largest pretrained model. Models with a * indicate that they have been previously reported in the literature. Other numbers are calculated by using pretrained models when available or from training with the author’s official training scripts.should be a path to an image"
+        assert frames is not str, "Frames Cross-modal retrieval using 1000 evaluation videos from the PlacesAudio and AudioSet validation datasets. DenseAV dramatically outperforms all approaches tested in all metrics. Most notably, the state-of-the-art image retrieval foundation model, ImageBind, is incapable of recognizing speech. We note that the ImageBind authors do not publish retraining code, so we evaluate their largest pretrained model. Models with a * indicate that they have been previously reported in the literature. Other numbers are calculated by using pretrained models when available or from training with the author's official training scripts.should be a path to an image"
         if frames is not None:
             image = Image.open(frames).convert('RGB')
             transform = transforms.Compose([
@@ -502,7 +557,11 @@ class MultiModalModel(nn.Module):
         if frames is not None:
             embeddings['visual_feats'] = self.visual_embedder(frames)
         if text_list is not None:
-            embeddings['text_feats'], _ = self.text_embedder(text_list)
+            text_feats, attn_mask, tfidf_weights = self.text_embedder(text_list)
+            embeddings['text_feats'] = text_feats
+            embeddings['text_attention_mask'] = attn_mask
+            if tfidf_weights is not None:
+                embeddings['text_tfidf_weights'] = tfidf_weights
 
         # if two or more modalities are present, we compute the similarity matrix 
         if frames is not None and text_list is not None:
