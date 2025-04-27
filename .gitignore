@@ -7,3 +7,5 @@ src/ms_coco_ret.py
 /useless/
 .gitignore
 results.txt
+run_training.sh
+/src/basemodel.py
