@@ -293,7 +293,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-text-unnormalized-difftemp", config=self.config)
+            wandb.init(project=self.project_name, name="WatchWhereYouLook", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -698,7 +698,7 @@ class MultiModalTrainer:
                     _, val_tv_loss, val_total_loss = self.validate(phase=phase)
                     print(f"Validation_Text_Visual: {f'{val_tv_loss:.4f}' if val_tv_loss is not None else 'N/A'}, " +
                           f"Validation_Total: {f'{val_total_loss:.4f}' if val_total_loss is not None else 'N/A'}")
-                    self.eval_1000_way_retrieval()
+                    #self.eval_1000_way_retrieval()
                 self.global_step += 1
                 
             epoch_loss = np.mean(epoch_losses)
@@ -707,7 +707,7 @@ class MultiModalTrainer:
             if self.val_tv_dataloader:
                 self.logger.info(f"Running validation after epoch {epoch}...")
                 _, val_tv_loss, val_total_loss = self.validate(phase=phase)
-                self.eval_1000_way_retrieval()
+                #self.eval_1000_way_retrieval()
                 if val_total_loss is not None:
                     self.logger.info(f"Validation loss after epoch {epoch}: {val_total_loss:.4f}")
                     if val_total_loss < self.best_loss:
@@ -730,7 +730,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-unnormalized-difftemp",
+        output_dir="./outputs-multihead-base",
         batch_size_tv=60,
         num_epochs=10,
         learning_rate=1e-4,
@@ -743,7 +743,7 @@ if __name__ == "__main__":
         gradient_accumulation_steps=1,
         unfreeze_text_step=5000,
         unfreeze_vit_step=0,
-        project_name="TriadText",
+        project_name="Multilooks",
         num_vis_samples_tv=60,
         use_amp=True,
         validation_frequency=20000

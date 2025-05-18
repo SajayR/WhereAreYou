@@ -61,14 +61,26 @@ def compute_recall_at_k(sim_matrix):
 # --------------------------------------------------------------------------- #
 # For Text->Visual retrieval:
 # --------------------------------------------------------------------------- #
-def aggregator_tv_t2v(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) *temperature   
-    max_sims = token_sims.max(dim=1).values
+def aggregator_tv_t2v(model, t_feats, v_feats, temperature):
+    """ Aggregates T->V similarity using max over heads and visual tokens. """
+    Dh = t_feats.shape[-1] // model.num_heads
+    t = t_feats.view(-1, model.num_heads, Dh)          # Nt,H,Dh
+    v = v_feats.view(-1, model.num_heads, Dh)          # Nv,H,Dh
+    # Calculate similarity per head
+    sim_h = torch.einsum('thd,vhd->h t v', t, v) * temperature # H,Nt,Nv
+    # Max over heads (dim 0), then max over visual tokens (dim -1)
+    max_sims = sim_h.max(0).values.max(-1).values      # (Nt,)
     return max_sims.mean().item()
 
-def aggregator_tv_v2t(t_feats, v_feats, temperature):
-    token_sims = torch.matmul(t_feats, v_feats.t()) * temperature
-    max_sims = token_sims.max(dim=0).values
+def aggregator_tv_v2t(model, t_feats, v_feats, temperature):
+    """ Aggregates V->T similarity using max over heads and text tokens. """
+    Dh = t_feats.shape[-1] // model.num_heads # Assuming t_feats and v_feats have same D
+    t = t_feats.view(-1, model.num_heads, Dh)          # Nt,H,Dh
+    v = v_feats.view(-1, model.num_heads, Dh)          # Nv,H,Dh
+    # Calculate similarity per head
+    sim_h = torch.einsum('thd,vhd->h t v', t, v) * temperature # H,Nt,Nv
+    # Max over heads (dim 0), then max over text tokens (dim 0 of the result)
+    max_sims = sim_h.max(0).values.max(0).values      # (Nv,)
     return max_sims.mean().item()
 
 def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8):

@@ -19,7 +19,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from typing import List, Tuple
-
+import math 
 ###############################################################################
 # Helper utilities
 ###############################################################################
@@ -39,10 +39,11 @@ def denorm(img: torch.Tensor) -> np.ndarray:
 ###############################################################################
 
 class TextVisualizer:
-    def __init__(self, patch_size: int = 14, image_size: int = 224):
+    def __init__(self, patch_size: int = 14, image_size: int = 224, max_heads_vis: int = 4):
         self.patch_size = patch_size
         self.image_size = image_size
         self.num_patches = image_size // patch_size
+        self.max_heads_vis = max_heads_vis 
         colors = [
             (0, 0, 0, 0),
             (0, 0, 1, 0.5),
@@ -190,23 +191,45 @@ class TextVisualizer:
 
         model.eval()
         with torch.no_grad():
-            vf = model.visual_embedder(frame.unsqueeze(0))
-            tf, mask = model.text_embedder([text])
-            sims = model.compute_similarity_matrix(tf, vf).squeeze(0)[: int(mask.sum())]
+            # Assuming text_embedder returns (feats, mask) tuple
+            vf, (tf, mask) = (
+                model.visual_embedder(frame.unsqueeze(0)),
+                model.text_embedder([text])
+            )
+
+            H   = getattr(model, 'num_heads', 1)
+            H   = max(1, H)                           # safety
+            # Assuming self.max_heads_vis exists or default to H
+            Hvis = min(H, getattr(self, 'max_heads_vis', H)) # cap for readability
+
+            B, Nt, D = tf.shape # B is 1 here
+            Nv       = vf.shape[1]
+            Dh       = D // H
+            # Reshape features per head, removing batch dim (B=1)
+            t = tf.squeeze(0).view(Nt, H, Dh).permute(1, 0, 2)          # H, Nt, Dh
+            v = vf.squeeze(0).view(Nv, H, Dh).permute(1, 0, 2)          # H, Nv, Dh
+            # Compute similarity per head
+            sims_head = torch.matmul(t, v.transpose(-2, -1)) * model.temperature  # H,Nt,Nv
+            # Trim padding based on mask and limit heads to Hvis
+            sims_head = sims_head[:Hvis, : int(mask.sum())]   # Hvis, Nt_actual, Nv
 
         tokenizer = model.text_embedder.tokenizer
         enc   = tokenizer(text, add_special_tokens=False,
                           return_offsets_mapping=True)
-        toks  = [t.replace("Ġ", "").replace("▁", "")
+        toks  = [t.replace("Ġ", "").replace(" ", "")
                  for t in tokenizer.convert_ids_to_tokens(enc["input_ids"])]
         words, groups = self._group_tokens(toks, enc["offset_mapping"], text)
 
-        word_maps = self._merge(self._patches_to_heatmaps(sims), groups)
-        img_np    = denorm(frame)
+        # ----- produce heat-maps for every head we visualise -----
+        head_word_maps = [
+            self._merge(self._patches_to_heatmaps(sims_head[h]), groups)
+            for h in range(Hvis)                                                # list length Hvis
+        ]
+        img_np    = denorm(frame) # Assuming denorm is defined elsewhere
 
-        n_cells = len(words) + 1           # +1 for the ground‑truth panel
+        n_cells = len(words) + 1           # ground truth + every word
         cols    = min(4, n_cells)
-        rows    = (n_cells + cols - 1) // cols
+        rows    = (n_cells + cols - 1) // cols * (Hvis)   # one strip per head
 
         # ---------- determine uniform caption height ---------------- #
         import textwrap
@@ -218,36 +241,63 @@ class TextVisualizer:
 
         # ---------- build the figure/grid --------------------------- #
         from matplotlib.gridspec import GridSpec
-        fig_h = (IMG_RATIO + cap_ratio) * rows * 1.1
+        import matplotlib.pyplot as plt # Ensure plt is imported
+        fig_h = (IMG_RATIO + cap_ratio) * rows * 1.1 # Use NEW rows
         fig   = plt.figure(figsize=(4.8 * cols, fig_h),
                            constrained_layout=False)
 
-        gs = GridSpec(rows * 2, cols,
-                      height_ratios=sum(([IMG_RATIO, cap_ratio] for _ in range(rows)), []),
+        gs = GridSpec(rows * 2, cols, # Use NEW rows
+                      height_ratios=sum(([IMG_RATIO, cap_ratio]
+                                         for _ in range(rows)), []), # Use NEW rows
                       hspace=0.25, wspace=0.02, figure=fig)
 
         def panel(r, c):
-            return fig.add_subplot(gs[r, c])
+            # Ensure r is within bounds for gs
+            if r < rows * 2:
+                 return fig.add_subplot(gs[r, c])
+            else:
+                 # Handle potential index out of bounds, though logic should prevent this
+                 print(f"Warning: Attempting to access invalid grid row {r}")
+                 return fig.add_subplot(gs[0,0]) # Fallback or raise error
 
-        # ----- ground truth ----------------------------------------- #
-        ax_img = panel(0, 0)
-        ax_img.imshow(img_np);  ax_img.axis("off")
-        ax_img.set_title("Ground truth", pad=4)
-        panel(1, 0).axis("off")   # blank caption keeps grid tidy
+        panel_idx = 0
 
-        # ----- attention overlays ----------------------------------- #
-        for k, (w, hmap) in enumerate(zip(words, word_maps), start=1):
-            r, c = divmod(k, cols)
-            ax_img = panel(2 * r,     c)
-            ax_cap = panel(2 * r + 1, c)
+        # loop over heads first, then words
+        for h in range(Hvis):
+            # ----- ground truth for this head row -----
+            if h > 0:
+                panel_idx = math.ceil(panel_idx / cols) * cols
+            r, c = divmod(panel_idx, cols)
+            ax_img = panel(2 * r, c)
+            ax_img.imshow(img_np); ax_img.axis("off")
+            ax_img.set_title(f"GT  (head {h})", pad=4)
+            panel(2 * r + 1, c).axis("off") # Blank caption panel
+            panel_idx += 1
 
-            ax_img.imshow(self._overlay(img_np, hmap.cpu().numpy()))
-            ax_img.axis("off")
+            # ----- every word for this head -----
+            # Ensure head_word_maps[h] has the same length as words
+            if len(head_word_maps[h]) != len(words):
+                 print(f"Warning: Mismatch between words ({len(words)}) and heatmaps ({len(head_word_maps[h])}) for head {h}")
+                 continue # Skip this head or handle error appropriately
 
-            ax_cap.axis("off")
-            self._draw_caption(ax_cap, text, w,
-                               max_chars=CAP_WRAP,
-                               font_size=CAP_FONT_SIZE)
+            for w, hmap in zip(words, head_word_maps[h]):
+                if panel_idx >= rows * cols: # Safety check
+                    print(f"Warning: Exceeded expected panel count ({rows * cols})")
+                    break
+                r, c = divmod(panel_idx, cols)
+                ax_i = panel(2 * r,     c)
+                ax_c = panel(2 * r + 1, c)
+
+                ax_i.imshow(self._overlay(img_np, hmap.cpu().numpy())) # Assuming _overlay exists
+                ax_i.axis("off")
+                ax_c.axis("off")
+                self._draw_caption(ax_c, text, w, # Assuming _draw_caption exists
+                                   max_chars=CAP_WRAP, font_size=CAP_FONT_SIZE)
+                panel_idx += 1
+            
+            if panel_idx >= rows * cols: # Break outer loop if exceeded
+                break
+
 
         # ----- save / show ------------------------------------------ #
         if output_path:

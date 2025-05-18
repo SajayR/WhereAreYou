@@ -301,7 +301,9 @@ class MultiModalModel(nn.Module):
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1,
-        use_amp=True
+        use_amp=True,
+        num_heads: int = 2,              # NEW
+        disentangle_weight: float = 0.05 # NEW
     ):
         super().__init__()
 
@@ -309,6 +311,9 @@ class MultiModalModel(nn.Module):
         self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
+        assert 512 % num_heads == 0, "embedding_dim must be divisible by num_heads"
+        self.num_heads         = num_heads
+        self.disentangle_w     = disentangle_weight
 
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
@@ -329,8 +334,15 @@ class MultiModalModel(nn.Module):
         #feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
-            sim = torch.bmm(feats1, feats2.transpose(1, 2))
-            return sim * self.temperature
+            B, N1, D = feats1.shape
+            N2       = feats2.shape[1]
+            Dh       = D // self.num_heads
+
+            f1 = feats1.view(B, N1, self.num_heads, Dh).permute(0, 2, 1, 3)  # B,H,N1,Dh
+            f2 = feats2.view(B, N2, self.num_heads, Dh).permute(0, 2, 1, 3)  # B,H,N2,Dh
+            sims_h = torch.matmul(f1, f2.transpose(-2, -1)) * self.temperature  # B,H,N1,N2
+            sims   = sims_h.max(dim=1).values                                    # max over heads
+            return sims
 
 
     ######################################################
@@ -338,49 +350,52 @@ class MultiModalModel(nn.Module):
     ######################################################
     def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
         """
-        cross-batch approach: (text_i, visual_j)
-        text_feats:   (B, Nt, D)
-        visual_feats: (B, Nv, D)
-        attention_mask: (B, Nt)
-        
         Returns:
-            clip_sims: (B, B)
-            token_sims: (B, B, Nt, Nv)
+            clip_sims        : (B,B)    – scalar similarity per pair
+            token_sims_agg   : (B,B,Nt,Nv)  – after max over heads
+            token_sims_full  : (B,B,H,Nt,Nv) – before max (for regularisers)
         """
-        B = text_feats.shape[0]
-        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
-        # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) * self.temperature
-        # max over visual dimension => (B, B, Nt)
-        max_sims = torch.max(token_sims, dim=3)[0]
-        # we need masked mean over Nt
-        # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
-        mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        masked_sum = (max_sims * mask).sum(dim=2)  # (B, B)
-        valid_tokens = mask.sum(dim=2).clamp(min=1e-7) 
-        clip_sims = masked_sum / valid_tokens
+        B, Nt, D  = text_feats.shape
+        Nv        = visual_feats.shape[1]
+        Dh        = D // self.num_heads
 
-        return clip_sims, token_sims
+        # add head dim
+        t = text_feats.view(B, Nt, self.num_heads, Dh)
+        v = visual_feats.view(B, Nv, self.num_heads, Dh)
 
-    def compute_regularization_losses_tv(self, token_sims):
+        # cross-batch expand
+        t = t.unsqueeze(1).expand(-1, B, -1, -1, -1)  # B,B,Nt,H,Dh
+        v = v.unsqueeze(0).expand(B, -1, -1, -1, -1)  # B,B,Nv,H,Dh
+
+        token_sims_full = torch.einsum('ijthd,ijvhd->ijhtv', t, v) * self.temperature   # B,B,H,Nt,Nv
+        token_sims_agg  = token_sims_full.max(dim=2).values            # max over heads  -> B,B,Nt,Nv
+        max_spat        = token_sims_agg.max(dim=3).values             # max over Nv     -> B,B,Nt
+
+        mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)   # B,B,Nt
+        masked_sum   = (max_spat * mask).sum(dim=2)                    # B,B
+        valid_tokens = mask.sum(dim=2).clamp(min=1e-7)                 # B,B
+        clip_sims    = masked_sum / valid_tokens                       # B,B
+
+        return clip_sims, token_sims_agg, token_sims_full
+
+
+    def compute_regularization_losses_tv(self,
+                                       token_sims_agg,
+                                       token_sims_full=None):
         """
-        1) negative sims near zero
-        2) patch usage sparsity on positive pairs
+        1) non-negativity on negatives
+        2) patch-usage sparsity on positives
+        3) (optional) head disentanglement
         """
-        # (B, B, Nt, Nv)
-        B = token_sims.shape[0]
-        # 1) negative clamp
-        neg_sims = torch.clamp(token_sims, min=-20, max=0)
-        l_nonneg = torch.mean(neg_sims**2)
-        # 2) patch usage sparsity (for the diagonal pairs only)
-        positive_sims = []
-        for i in range(B):
-            # shape (Nt, Nv) from token_sims[i, i]
-            positive_sims.append(token_sims[i, i])
-        if len(positive_sims) == 0:
+        B = token_sims_agg.shape[0]
+        neg_sims = torch.clamp(token_sims_agg, min=-20, max=0)
+        l_nonneg = torch.mean(neg_sims ** 2)
+
+        # ---------- sparsity on positive pairs ----------
+        positive_sims = [token_sims_agg[i, i] for i in range(B)]  # (Nt,Nv)
+        if not positive_sims:                                     # unlikely
             return 0.15 * l_nonneg
-        positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
+        positive_sims = torch.stack(positive_sims, dim=0)
         # softmax over patches => (B, Nt, Nv)
         patch_probs = F.softmax(positive_sims, dim=-1)
         # fraction usage per patch => sum over Nt, then / Nt => (B, Nv)
@@ -390,16 +405,19 @@ class MultiModalModel(nn.Module):
         loss_sparsity = (excess ** 2).mean()
         reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
 
-        #temp constraints
-        temp = self.temperature
-        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
-                               - torch.log(temp), min=0) ** 2
-        #temp_high = torch.clamp(torch.log(temp) 
-         #                       - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
-        #l_cal = temp_low# + temp_high
+        # ---------- disentanglement (H=2 only) ----------
+        if (token_sims_full is not None) and (self.num_heads >= 2):
+            pos_full = torch.stack([token_sims_full[i, i] for i in range(B)], dim=0)  # B,H,Nt,Nv
+            head0, head1 = pos_full[:, 0], pos_full[:, 1]                             # B,Nt,Nv each
+            l_dis = torch.mean(torch.abs(head0 * head1))
+            reg_loss = reg_loss + self.disentangle_w * l_dis
+
+        # temperature floor (unchanged)
+        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims_agg.device))
+                               - torch.log(self.temperature), min=0) ** 2
         return reg_loss + temp_low
 
-    def compute_contrastive_loss_tv(self, clip_sims, token_sims):
+    def compute_contrastive_loss_tv(self, clip_sims, token_sims_agg, token_sims_full):
         """
         Standard cross-entropy for text<->visual plus the reg losses,
         now with similarity statistics tracking.
@@ -435,7 +453,7 @@ class MultiModalModel(nn.Module):
         losses_v2t = -log_prob_v2t[torch.arange(B), labels]
 
         contrastive_loss = (losses_t2v + losses_v2t).mean() / 2
-        reg_loss = self.compute_regularization_losses_tv(token_sims)
+        reg_loss = self.compute_regularization_losses_tv(token_sims_agg, token_sims_full)
 
         total_loss = contrastive_loss + reg_loss
         
@@ -464,8 +482,9 @@ class MultiModalModel(nn.Module):
             text_feats, attention_mask = self.text_embedder(text_list) # (B, Nt, D), (B, Nt)
             #visual_feats = F.normalize(visual_feats, dim=-1)
             #text_feats = F.normalize(text_feats, dim=-1)
-            clip_sims, token_sims = self.compute_all_similarities_tv(text_feats, visual_feats, attention_mask)
-            return self.compute_contrastive_loss_tv(clip_sims, token_sims)
+            clip_sims, tok_agg, tok_full = self.compute_all_similarities_tv(
+                                              text_feats, visual_feats, attention_mask)
+            return self.compute_contrastive_loss_tv(clip_sims, tok_agg, tok_full)
 
 
     def forward(self, frames=None, text_list=None):
