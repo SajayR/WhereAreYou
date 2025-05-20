@@ -21,7 +21,7 @@ from viz import TextVisualizer
 from retrieval import compute_tv_retrieval_metrics
 warnings.filterwarnings("ignore")
 import time
-
+from soap import SOAP
 ###########################################
 #         Collate for the Text Dataset
 ###########################################
@@ -213,11 +213,14 @@ class MultiModalTrainer:
             print("WARNING: No LoRA parameters found! Check implementation.")
 
         # Optimizer for "others"
-        self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
+        #self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
+        self.opt_others = SOAP(params=self.others_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
         # Optimizer for text encoder (frozen at start)
-        self.opt_text = torch.optim.AdamW(self.text_params, lr=learning_rate)
+        #self.opt_text = torch.optim.AdamW(self.text_params, lr=learning_rate)
+        self.opt_text = SOAP(params=self.text_params, lr = 1e-4, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
         # Optimizer for vision (LoRA) parameters
-        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
+        #self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
+        self.opt_vit = SOAP(params=self.vit_lora_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
 
         # Freeze text parameters until reaching the unfreeze step
         for p in self.text_params:
@@ -293,7 +296,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="TriadIsDeadButFuckPatches", config=self.config)
+            wandb.init(project=self.project_name, name="Triadmightbedeadbuthassoap", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -744,7 +747,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-fixedpatchdropout",
+        output_dir="./outputs-fixedpatchdropout-soap",
         batch_size_tv=50,
         num_epochs=10,
         learning_rate=1e-4,
