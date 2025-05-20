@@ -333,35 +333,61 @@ class MultiModalModel(nn.Module):
             return sim * self.temperature
 
 
-    ######################################################
+        ######################################################
     #               TEXT-VISUAL PATH
     ######################################################
-    def compute_all_similarities_tv(self, text_feats, visual_feats, attention_mask):
+    def compute_all_similarities_tv(self,
+                                    text_feats:  torch.Tensor,
+                                    visual_feats: torch.Tensor,
+                                    attention_mask: torch.Tensor):
         """
-        cross-batch approach: (text_i, visual_j)
-        text_feats:   (B, Nt, D)
-        visual_feats: (B, Nv, D)
-        attention_mask: (B, Nt)
-        
-        Returns:
-            clip_sims: (B, B)
-            token_sims: (B, B, Nt, Nv)
+        Bidirectional max-mean aggregation (t → v and v → t).
+
+        Parameters
+        ----------
+        text_feats      : (B, Nt, D)   text-token embeddings
+        visual_feats    : (B, Nv, D)   visual-patch embeddings
+        attention_mask  : (B, Nt)      1 for real tokens, 0 for padding
+
+        Returns
+        -------
+        clip_sims  : (B, B)             symmetric similarity matrix
+        token_sims : (B, B, Nt, Nv)     raw token-level similarities
         """
-        B = text_feats.shape[0]
-        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)  # (B, B, Nt, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1) # (B, B, Nv, D)
-        # token-level similarity => (B, B, Nt, Nv)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3)) * self.temperature
-        # max over visual dimension => (B, B, Nt)
-        max_sims = torch.max(token_sims, dim=3)[0]
-        # we need masked mean over Nt
-        # attn_mask_expanded => (B, 1, Nt) => (B, B, Nt)
-        mask = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        masked_sum = (max_sims * mask).sum(dim=2)  # (B, B)
-        valid_tokens = mask.sum(dim=2).clamp(min=1e-7) 
-        clip_sims = masked_sum / valid_tokens
+        B = text_feats.size(0)
+
+        # Broadcast so we can compare every text in the batch with every image
+        #text_feats = F.normalize(text_feats, dim=-1)
+        #visual_feats = F.normalize(visual_feats, dim=-1)
+        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Nt, D)
+        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
+
+        # Full token-level similarity tensor
+        token_sims = torch.matmul(tf, vf.transpose(2, 3))           # (B, B, Nt, Nv)
+        token_sims = token_sims * self.temperature                   # scale by learned temp
+
+        # ------------------------------------------------------------
+        # 1)  text → visual • max over patches, mean over tokens
+        # ------------------------------------------------------------
+        t2v_max  = token_sims.max(dim=3).values                      # (B, B, Nt)
+        t_mask   = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
+        t2v_sum  = (t2v_max * t_mask).sum(dim=2)                     # (B, B)
+        valid_t  = t_mask.sum(dim=2).clamp(min=1e-7)
+        t2v_clip = t2v_sum / valid_t                                 # (B, B)
+
+        # ------------------------------------------------------------
+        # 2)  visual → text • max over tokens, mean over patches
+        # ------------------------------------------------------------
+        v2t_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
+        v2t_clip = v2t_max.mean(dim=2)                               # (B, B)
+
+        # ------------------------------------------------------------
+        # 3)  symmetric similarity
+        # ------------------------------------------------------------
+        clip_sims = 0.5 * (t2v_clip + v2t_clip)                      # (B, B)
 
         return clip_sims, token_sims
+
 
     def compute_regularization_losses_tv(self, token_sims):
         """
