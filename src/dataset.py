@@ -3,7 +3,7 @@ import warnings
 import multiprocessing
 from pathlib import Path
 from urllib.parse import urlparse
-import av
+#import av
 import datasets
 import numpy as np
 import random
@@ -16,7 +16,7 @@ from torchvision import transforms
 from typing import Dict, List
 import torchaudio
 warnings.filterwarnings("ignore")
-from torchcodec.decoders import VideoDecoder
+
 import random
 try:
     multiprocessing.set_start_method('fork', force=True)

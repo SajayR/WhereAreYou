@@ -20,7 +20,7 @@ from model import MultiModalModel
 from viz import TextVisualizer
 from retrieval import compute_tv_retrieval_metrics
 warnings.filterwarnings("ignore")
-
+import time
 
 ###########################################
 #         Collate for the Text Dataset
@@ -182,7 +182,7 @@ class MultiModalTrainer:
             temperature=1.5,
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.00,
-            visual_dropout_prob=0.25,
+            visual_dropout_prob=0.20,
             use_amp=use_amp
         ).to(self.device)
         #enabling gradient checkpointing
@@ -293,7 +293,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Triad-text-unnormalized-difftemp", config=self.config)
+            wandb.init(project=self.project_name, name="TriadIsDeadButFuckPatches", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -302,7 +302,10 @@ class MultiModalTrainer:
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
 
         print("Compiling model")
-        self.model = torch.compile(self.model, mode="max-autotune")
+        start_time = time.time()
+        torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
+        end_time = time.time()
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
 
         self.logger.info("Initialized MultiModalTrainer for text-visual training.")
 
@@ -340,7 +343,7 @@ class MultiModalTrainer:
             "step": step,
             "current_batch_idx": self.current_batch_idx,
             "rng_state": rng_state,
-            "model_state_dict": self.model._orig_mod.state_dict(),
+            "model_state_dict": self.model._orig_mod.state_dict() if hasattr(self.model, '_orig_mod') else self.model.state_dict(),
             "opt_others_state": self.opt_others.state_dict(),
             "opt_text_state": self.opt_text.state_dict(),
             "opt_vit_state": self.opt_vit.state_dict(),
@@ -490,6 +493,12 @@ class MultiModalTrainer:
                         "visualization_phase": "text"
                     })
         self.model.train()
+        print("Compiling model")
+        start_time = time.time()
+        #torch.compile(self.model, mode="max-autotune")
+        torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
+        end_time = time.time()
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
         plt.close('all')
         gc.collect()
 
@@ -540,7 +549,12 @@ class MultiModalTrainer:
             wandb.log(wandb_dict)
         
         self.model.train()
-        
+        print("Compiling model")
+        start_time = time.time()
+        #torch.compile(self.model, mode="max-autotune")
+        torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
+        end_time = time.time()
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
         return None, avg_tv_loss, val_total_loss
     
 
@@ -730,8 +744,8 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-null-patch",
-        batch_size_tv=60,
+        output_dir="./outputs-fixedpatchdropout",
+        batch_size_tv=50,
         num_epochs=10,
         learning_rate=1e-4,
         use_wandb=True,
@@ -740,11 +754,11 @@ if __name__ == "__main__":
         save_every_steps=10000,
         num_workers=12,
         device="cuda",
-        gradient_accumulation_steps=1,
+        gradient_accumulation_steps=2,
         unfreeze_text_step=5000,
         unfreeze_vit_step=0,
-        project_name="TriadText",
-        num_vis_samples_tv=60,
+        project_name="TriadIsdead",
+        num_vis_samples_tv=50,
         use_amp=True,
         validation_frequency=20000
     )
