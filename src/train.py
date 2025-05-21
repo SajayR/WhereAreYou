@@ -197,23 +197,24 @@ class MultiModalTrainer:
         #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
         self.text_params = []
-        self.vit_lora_params = []
+        #self.vit_lora_params = []
         self.vit_params = []
         self.others_params = []
         for name, param in self.model.named_parameters():
             if "text_embedder.encoder" in name:
                 self.text_params.append(param)
-            elif "visual_embedder.model" in name and "lora" in name:
-                self.vit_lora_params.append(param)
+            #elif "visual_embedder.model" in name and "lora" in name:
+                #self.vit_lora_params.append(param)
             elif "visual_embedder.model" in name and "lora" not in name:
                 self.vit_params.append(param)
             else:
                 self.others_params.append(param)
 
-        print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
-        print(f"Number of ViT parameters: {len(self.vit_params)}")
-        if len(self.vit_lora_params) == 0:
-            print("WARNING: No LoRA parameters found! Check implementation.")
+        #print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
+        print(f"Number of ViT parameters: {sum(p.numel() for p in self.vit_params)}")
+        print(f"Number of Text parameters: {sum(p.numel() for p in self.text_params)}")
+        #if len(self.vit_lora_params) == 0:
+        #    print("WARNING: No LoRA parameters found! Check implementation.")
 
         # Optimizer for "others"
         self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
@@ -222,14 +223,14 @@ class MultiModalTrainer:
         self.opt_text = torch.optim.AdamW(self.text_params, lr=learning_rate*0.1)
         #self.opt_text = SOAP(params=self.text_params, lr = 1e-4, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
         # Optimizer for vision (LoRA) parameters
-        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
+        self.opt_vit = torch.optim.AdamW(self.vit_params, lr=learning_rate*0.1)
         #self.opt_vit = SOAP(params=self.vit_lora_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
 
         # Freeze text parameters until reaching the unfreeze step
         for p in self.text_params:
             p.requires_grad = False
-        for p in self.vit_lora_params:
-            p.requires_grad = True
+        #for p in self.vit_lora_params:
+        #    p.requires_grad = True
         for p in self.vit_params:
             p.requires_grad = False
 
@@ -299,7 +300,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Duod-classic-256dim-stable", config=self.config)
+            wandb.init(project=self.project_name, name="Duod-classic-256dim-stable-nolora", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -437,6 +438,13 @@ class MultiModalTrainer:
         else:
             for p in text_module.parameters():
                 p.requires_grad = True
+
+        if current_step >= self.config['unfreeze_vit_step']:
+            for p in self.model.visual_embedder.model.parameters():
+                p.requires_grad = True
+        else:
+            for p in self.model.visual_embedder.model.parameters():
+                p.requires_grad = False
 
 
     ###########################################
@@ -596,7 +604,7 @@ class MultiModalTrainer:
         accumulation_counter = 0
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             #self.eval_1000_way_retrieval()
-            self.visualize_samples(epoch)
+            #self.visualize_samples(epoch)
             phase = "text"
             self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Training")
             self.logger.info(f"Epoch {epoch} starting")
@@ -655,6 +663,7 @@ class MultiModalTrainer:
                     grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
 
                     clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
+                    clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
 
                     # Step each optimizer
                     self.opt_others.step()
@@ -750,21 +759,21 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-nosoap-infonce-adam-classic",
-        batch_size_tv=60,
+        output_dir="./outputs-nosoap-infonce-adam-classic-nolora",
+        batch_size_tv=80,
         num_epochs=10,
         learning_rate=1e-4,
-        use_wandb=True,
+        use_wandb=False,
         force_new_training=False,
         vis_every=10000,
         save_every_steps=10000,
-        num_workers=12,
+        num_workers=11,
         device="cuda",
-        gradient_accumulation_steps=5,
+        gradient_accumulation_steps=4,
         unfreeze_text_step=5000,
-        unfreeze_vit_step=0,
+        unfreeze_vit_step=5000,
         project_name="TriadIsdead",
-        num_vis_samples_tv=55,
+        num_vis_samples_tv=50,
         use_amp=True,
         validation_frequency=20000
     )

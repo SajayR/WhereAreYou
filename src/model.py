@@ -306,7 +306,9 @@ class MultiModalModel(nn.Module):
         super().__init__()
 
         self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
-        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        #self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        self.visual_embedder = ViTEmbedder(arch='dinov2_vits14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
         self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.02)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
