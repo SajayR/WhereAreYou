@@ -307,11 +307,11 @@ class MultiModalTrainer:
         self.text_viz = TextVisualizer()
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
 
-        print("Compiling model")
+        '''print("Compiling model")
         start_time = time.time()
         torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
         end_time = time.time()
-        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")'''
 
         self.logger.info("Initialized MultiModalTrainer for text-visual training.")
 
@@ -499,12 +499,12 @@ class MultiModalTrainer:
                         "visualization_phase": "text"
                     })
         self.model.train()
-        print("Compiling model")
+        '''print("Compiling model")
         start_time = time.time()
         #torch.compile(self.model, mode="max-autotune")
         torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
         end_time = time.time()
-        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")'''
         plt.close('all')
         gc.collect()
 
@@ -555,12 +555,12 @@ class MultiModalTrainer:
             wandb.log(wandb_dict)
         
         self.model.train()
-        print("Compiling model")
+        '''print("Compiling model")
         start_time = time.time()
         #torch.compile(self.model, mode="max-autotune")
         torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
         end_time = time.time()
-        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")'''
         return None, avg_tv_loss, val_total_loss
     
 

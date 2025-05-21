@@ -166,5 +166,6 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
         'V->T_r10': vt_metrics['r10'],
         'V->T_r20': vt_metrics['r20'],
     }
+    del text_feats_list, image_feats_list, sim_mat_t2v, sim_mat_v2t
     return results
 
