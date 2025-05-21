@@ -30,13 +30,13 @@ class TextEmbedder(nn.Module):
     pre-trained BERT-like model to extract text features.
     Projects them down to a desired embedding dimension.
     """
-    def __init__(self, embedding_dim=512, model_name="answerdotai/ModernBERT-base"):
+    def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base"):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
-        self.projection1 = nn.Linear(self.encoder.config.hidden_size, 512)
-        self.layer_norm = nn.LayerNorm(512)
-        self.projection2 = nn.Linear(512, embedding_dim)
+        self.projection1 = nn.Linear(self.encoder.config.hidden_size, 256)
+        self.layer_norm = nn.LayerNorm(256)
+        self.projection2 = nn.Linear(256, embedding_dim)
         print("Using text model: ", model_name)
         
         for param in self.encoder.parameters():
@@ -83,13 +83,13 @@ class ViTEmbedder(nn.Module):
     Then projects to a common dimension with a linear layer.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=512, dropout_prob=0.1):
+                 embedding_dim=256, dropout_prob=0.1):
         super().__init__()
         self.model = torch.hub.load(model_name, arch)
         print("Using DINOv2 model: ", arch)
-        self.projection1 = nn.Linear(self.model.embed_dim, 512)
-        self.layer_norm = nn.LayerNorm(512)
-        self.projection2 = nn.Linear(512, embedding_dim)
+        self.projection1 = nn.Linear(self.model.embed_dim, 256)
+        self.layer_norm = nn.LayerNorm(256)
+        self.projection2 = nn.Linear(256, embedding_dim)
         #self.dropout = nn.Dropout(dropout_prob)
         self.patch_dropout_rate = dropout_prob
         self.patch_dropout = self.patch_dropout
@@ -171,7 +171,7 @@ class ViTLoRAEmbedder(nn.Module):
     Projects output embeddings to a common dimension with a linear layer.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=512, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
+                 embedding_dim=256, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
         super().__init__()
         
         # Load the base model
@@ -212,9 +212,9 @@ class ViTLoRAEmbedder(nn.Module):
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"ViTLoRAEmbedder - Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}% of total)")
 
-        self.projection1 = nn.Linear(self.model.embed_dim, 512)
-        self.layer_norm = nn.LayerNorm(512)
-        self.projection2 = nn.Linear(512, embedding_dim)
+        self.projection1 = nn.Linear(self.model.embed_dim, 256)
+        self.layer_norm = nn.LayerNorm(256)
+        self.projection2 = nn.Linear(256, embedding_dim)
         self.patch_dropout_rate = dropout_prob
         self.patch_dropout = self.patch_dropout
         for param in self.model.parameters():
@@ -305,11 +305,12 @@ class MultiModalModel(nn.Module):
     ):
         super().__init__()
 
-        self.text_embedder  = TextEmbedder(embedding_dim=512, model_name=text_model_name)
-        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=512, dropout_prob=visual_dropout_prob)
-        self.null_patch = nn.Parameter(torch.randn(1, 1, 512) * 0.02)
+        self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
+        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.02)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
+       # self.bias = nn.Parameter(torch.tensor(-10.0))  # b₀ = −10 #only enable for sigmoid loss
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
@@ -426,7 +427,67 @@ class MultiModalModel(nn.Module):
         #l_cal = temp_low# + temp_high
         return reg_loss + temp_low
 
-    def compute_contrastive_loss_tv(self, clip_sims, token_sims):
+    '''def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor): #sigmoid
+        """
+        Pair-wise sigmoid contrastive loss for text-visual alignment.
+
+        Parameters
+        ----------
+        clip_sims : (B, B)   cosine-similarity matrix between every text in the batch
+                            and every image in the batch (higher = more similar)
+        token_sims: (B, B, Nt, Nv) token-level similarity tensor (needed only for the
+                    regularisation term carried over from the original code)
+
+        Returns
+        -------
+        total_loss        : scalar torch tensor
+        similarity_stats  : dict of useful monitoring statistics
+        """
+        B = clip_sims.size(0)
+
+        # ------------------------------------------------------------
+        # 1) labels  zᵢⱼ  are +1 for matching pairs, −1 otherwise
+        # ------------------------------------------------------------
+        labels = torch.full_like(clip_sims, -1.0)
+        labels.fill_diagonal_(1.0)           # positives on the main diagonal
+
+        # ------------------------------------------------------------
+        # 2) pair-wise sigmoid loss
+        #    L = − log σ( z · (s + b) )
+        # ------------------------------------------------------------
+        logits        = clip_sims + self.bias      # broadcast learnable bias b
+        pairwise_loss = -F.logsigmoid(labels * logits).mean()
+
+        # optional regularisation (unchanged from the original implementation)
+        reg_loss   = self.compute_regularization_losses_tv(token_sims)
+        total_loss = pairwise_loss + reg_loss
+
+        # ------------------------------------------------------------
+        # 3) similarity statistics for logging / debugging
+        # ------------------------------------------------------------
+        diag_mask        = torch.eye(B, dtype=torch.bool, device=clip_sims.device)
+        pos_sims         = clip_sims[diag_mask]         # positives
+        neg_sims         = clip_sims[~diag_mask]        # negatives
+
+        pos_sim_mean     = pos_sims.mean().item()
+        pos_sim_std      = pos_sims.std().item()
+        neg_sim_mean     = neg_sims.mean().item()
+        neg_sim_std      = neg_sims.std().item()
+        hardest_negative = neg_sims.max().item()
+        separation       = pos_sim_mean - neg_sim_mean  # mean gap
+
+        similarity_stats = {
+            "tv_pos_sim_mean": pos_sim_mean,
+            "tv_pos_sim_std":  pos_sim_std,
+            "tv_neg_sim_mean": neg_sim_mean,
+            "tv_neg_sim_std":  neg_sim_std,
+            "tv_separation":   separation,
+            "tv_hardest_negative": hardest_negative,
+        }
+
+        return total_loss, similarity_stats'''
+        
+    def compute_contrastive_loss_tv(self, clip_sims, token_sims): #infonce
         """
         Standard cross-entropy for text<->visual plus the reg losses,
         now with similarity statistics tracking.
@@ -477,6 +538,7 @@ class MultiModalModel(nn.Module):
         }
         
         return total_loss, similarity_stats
+
 
     def forward_text_visual(self, frames, text_list):
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
