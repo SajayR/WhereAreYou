@@ -185,7 +185,7 @@ class MultiModalTrainer:
             temperature=1.5,
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.00,
-            visual_dropout_prob=0.20,
+            visual_dropout_prob=0.10,
             use_amp=use_amp
         ).to(self.device)
         #enabling gradient checkpointing
@@ -197,23 +197,25 @@ class MultiModalTrainer:
         #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
         self.text_params = []
-        self.vit_lora_params = []
+        #self.vit_lora_params = []
         self.vit_params = []
         self.others_params = []
         for name, param in self.model.named_parameters():
             if "text_embedder.encoder" in name:
                 self.text_params.append(param)
-            elif "visual_embedder.model" in name and "lora" in name:
-                self.vit_lora_params.append(param)
+            #elif "visual_embedder.model" in name and "lora" in name:
+            #    self.vit_lora_params.append(param)
             elif "visual_embedder.model" in name and "lora" not in name:
                 self.vit_params.append(param)
             else:
                 self.others_params.append(param)
 
-        print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
-        print(f"Number of ViT parameters: {len(self.vit_params)}")
-        if len(self.vit_lora_params) == 0:
-            print("WARNING: No LoRA parameters found! Check implementation.")
+        #print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
+        print(f"Number of ViT parameters: {sum(p.numel() for p in self.vit_params):,}")
+        print(f"Number of Text parameters: {sum(p.numel() for p in self.text_params):,}")
+        print(f"Number of Other parameters: {sum(p.numel() for p in self.others_params):,}")
+        #if len(self.vit_lora_params) == 0:
+        #    print("WARNING: No LoRA parameters found! Check implementation.")
 
         # Optimizer for "others"
         self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
@@ -222,14 +224,14 @@ class MultiModalTrainer:
         self.opt_text = torch.optim.AdamW(self.text_params, lr=learning_rate*0.1)
         #self.opt_text = SOAP(params=self.text_params, lr = 1e-4, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
         # Optimizer for vision (LoRA) parameters
-        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
+        self.opt_vit = torch.optim.AdamW(self.vit_params, lr=learning_rate*0.1)
         #self.opt_vit = SOAP(params=self.vit_lora_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
 
         # Freeze text parameters until reaching the unfreeze step
         for p in self.text_params:
             p.requires_grad = False
-        for p in self.vit_lora_params:
-            p.requires_grad = True
+        #for p in self.vit_lora_params:
+        #    p.requires_grad = True
         for p in self.vit_params:
             p.requires_grad = False
 
@@ -299,7 +301,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Duod-classic-256dim-stable", config=self.config)
+            wandb.init(project=self.project_name, name="Duod-256-nolora-anneal-tempbound", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -397,7 +399,7 @@ class MultiModalTrainer:
         self.step_text = ck.get("sched_step_text", 0)
         self.step_vit = ck.get("sched_step_vit", 0)
         self.start_epoch = ck["epoch"]
-        self.global_step = ck["step"]
+        self.global_step = ck["step"] #+1 because we already did one step in the main loop
         self.current_batch_idx = ck.get("current_batch_idx", 0)
         self.best_loss = ck["best_loss"]
         rng_state = ck.get("rng_state", None)
@@ -425,6 +427,15 @@ class MultiModalTrainer:
             f"batch_offset={self.current_batch_idx})"
         )
 
+    #need to anneal tau from 0.15 to 0.07 in a fixed number of steps
+    def anneal_tau(self, current_step):
+        # Linear scaling from 0.15 to 0.07 during unfreeze_vit_step steps
+        num_steps = 20000
+        if current_step < num_steps:
+            progress = current_step / num_steps
+            self.model.tau = 0.30 - (0.30 - 0.05) * progress
+        else:
+            self.model.tau = 0.05
 
     ###########################################
     #  Freeze/Unfreeze logic (Text Only)
@@ -436,6 +447,14 @@ class MultiModalTrainer:
                 p.requires_grad = False
         else:
             for p in text_module.parameters():
+                p.requires_grad = True
+
+        visual_module = self.model.visual_embedder.model
+        if current_step < self.config['unfreeze_vit_step']:
+            for p in visual_module.parameters():
+                p.requires_grad = False
+        else:
+            for p in visual_module.parameters():
                 p.requires_grad = True
 
 
@@ -470,7 +489,8 @@ class MultiModalTrainer:
             else:
                 images.append(batch['images'][i])
                 captions.append(batch['captions'][i])
-        
+        del batch,dataset,clean_transform
+        gc.collect()
         return {
             "images": torch.stack(images),
             "texts": captions
@@ -497,7 +517,7 @@ class MultiModalTrainer:
                         "epoch": epoch,
                         "global_step": self.global_step,
                         "visualization_phase": "text"
-                    })
+                    }, commit=True)
         self.model.train()
         '''print("Compiling model")
         start_time = time.time()
@@ -541,7 +561,18 @@ class MultiModalTrainer:
         avg_tv_sim_stats = {}
         if tv_sim_stats_list:
             for key in tv_sim_stats_list[0].keys():
-                avg_tv_sim_stats[f"val_{key}"] = np.mean([stats[key] for stats in tv_sim_stats_list if key in stats])
+                vals = []
+                for stats in tv_sim_stats_list:
+                    if key not in stats:
+                        continue
+                    v = stats[key]
+                    # if it's a Tensor, move to CPU and get Python scalar
+                    if isinstance(v, torch.Tensor):
+                        v = v.detach().cpu().item()
+                    # otherwise assume it's already a number
+                    vals.append(v)
+                # now compute numpy mean over a list of floats
+                avg_tv_sim_stats[f"val_{key}"] = np.mean(vals)
         
         if self.use_wandb:
             wandb_dict = {
@@ -555,6 +586,8 @@ class MultiModalTrainer:
             wandb.log(wandb_dict)
         
         self.model.train()
+        del tv_losses, tv_sim_stats_list, avg_tv_sim_stats, tv_batch
+        gc.collect()
         '''print("Compiling model")
         start_time = time.time()
         #torch.compile(self.model, mode="max-autotune")
@@ -586,7 +619,8 @@ class MultiModalTrainer:
             for k, v in tv_results.items():
                 wandb_dict[f"retrieval_{k}"] = v
             wandb.log(wandb_dict)
-
+        del tv_results
+        gc.collect()
         self.logger.info("Done 1000-way retrieval evaluation.")
 
     ###########################################
@@ -594,9 +628,10 @@ class MultiModalTrainer:
     ###########################################
     def train(self):
         accumulation_counter = 0
+        wandb.watch(self.model, log="all")
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             #self.eval_1000_way_retrieval()
-            self.visualize_samples(epoch)
+            #self.visualize_samples(epoch)
             phase = "text"
             self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Training")
             self.logger.info(f"Epoch {epoch} starting")
@@ -616,6 +651,7 @@ class MultiModalTrainer:
 
             for batch_idx in pbar:
                 self._update_frozen_params(self.global_step)
+                self.anneal_tau(self.global_step)
                 grad_norm_others = None
                 grad_norm_text = None
                 grad_norm_vit = None
@@ -639,6 +675,11 @@ class MultiModalTrainer:
                     torch.cuda.empty_cache()
                     gc.collect()
                     continue
+                tv_sim_stats = {
+                    k: (v.item() if torch.is_tensor(v) else float(v))
+                    for k, v in tv_sim_stats.items()
+                }
+
                 loss_total = tv_loss
 
                 loss_scaled = loss_total / self.gradient_accumulation_steps
@@ -650,11 +691,12 @@ class MultiModalTrainer:
                     text_grads = [p.grad.norm() for p in self.text_params if p.grad is not None]
                     vit_grads = [p.grad.norm() for p in self.vit_params if p.grad is not None]
 
-                    grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
-                    grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
-                    grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
+                    #grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
+                    #grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
+                    #grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
 
                     clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
+                    clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
 
                     # Step each optimizer
                     self.opt_others.step()
@@ -671,12 +713,14 @@ class MultiModalTrainer:
                             self.step_text += 1
                     else:
                         self.opt_text.zero_grad()
-
-                    self.opt_vit.step()
-                    self.opt_vit.zero_grad()
-                    if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
-                        self.sched_vit.step()
-                        self.step_vit += 1
+                    if self.global_step >= self.config['unfreeze_vit_step']:
+                        self.opt_vit.step()
+                        self.opt_vit.zero_grad()
+                        if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
+                            self.sched_vit.step()
+                            self.step_vit += 1
+                    else:
+                        self.opt_vit.zero_grad()
 
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
@@ -693,18 +737,24 @@ class MultiModalTrainer:
                         "lr_text": self.opt_text.param_groups[0]['lr'],
                         "lr_vit": self.opt_vit.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
+                        "tau": self.model.tau
                     }
-                    if grad_norm_others is not None:
-                        wandb_dict["grad_norm_others"] = grad_norm_others.item()
-                    if grad_norm_text is not None:
-                        wandb_dict["grad_norm_text"] = grad_norm_text.item()
-                    if grad_norm_vit is not None:
-                        wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
-
-                    wandb_dict.update(tv_sim_stats)
+                    #if grad_norm_others is not None:
+                    #    wandb_dict["grad_norm_others"] = grad_norm_others.item()
+                    #if grad_norm_text is not None:
+                     #   wandb_dict["grad_norm_text"] = grad_norm_text.item()
+                    #if grad_norm_vit is not None:
+                    #    wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
+                    try:
+                        tv_sim_stats = {k: v.item() if torch.is_tensor(v) else float(v) for k, v in tv_sim_stats.items()}
+                        wandb_dict.update(tv_sim_stats)
+                    except:
+                        self.logger.info("Error converting tv_sim_stats to dict")
+                        wandb_dict.update(tv_sim_stats)
                     wandb.log(wandb_dict)
+                    
 
-                del loss_total
+                del tv_loss, tv_sim_stats, tv_batch, frames_tv, texts_tv
                 torch.cuda.empty_cache()
                 
                 if self.global_step % 500 == 0:
@@ -750,21 +800,21 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-nosoap-infonce-adam-classic",
-        batch_size_tv=60,
+        output_dir="./outputs-nolora-infonce-classic-annealing-tempbound",
+        batch_size_tv=64,
         num_epochs=10,
-        learning_rate=1e-4,
+        learning_rate=1e-3,
         use_wandb=True,
         force_new_training=False,
         vis_every=10000,
         save_every_steps=10000,
         num_workers=12,
         device="cuda",
-        gradient_accumulation_steps=5,
+        gradient_accumulation_steps=4,
         unfreeze_text_step=5000,
-        unfreeze_vit_step=0,
+        unfreeze_vit_step=5000,
         project_name="TriadIsdead",
-        num_vis_samples_tv=55,
+        num_vis_samples_tv=60,
         use_amp=True,
         validation_frequency=20000
     )

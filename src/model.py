@@ -306,15 +306,16 @@ class MultiModalModel(nn.Module):
         super().__init__()
 
         self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
-        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
-        self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.02)
-        #self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14', embedding_dim=512, dropout_prob=visual_dropout_prob)
+        #self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.05)
+        self.visual_embedder = ViTEmbedder(arch='dinov2_vits14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
        # self.bias = nn.Parameter(torch.tensor(-10.0))  # b₀ = −10 #only enable for sigmoid loss
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
         self.amp_dtype = torch.bfloat16
+        self.tau = 0.07
     ######################################################
     #               Shared Utilities
     ######################################################
@@ -326,8 +327,8 @@ class MultiModalModel(nn.Module):
         Returns sim: (B, N1, N2)
         """ 
         # ONLY NORMALIZE DURING INFERENCE, TRAINING CAUSES MODEL COLLAPSE
-        #feats1 = F.normalize(feats1, dim=-1)
-        #feats2 = F.normalize(feats2, dim=-1)
+        feats1 = F.normalize(feats1, dim=-1)
+        feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
@@ -358,8 +359,8 @@ class MultiModalModel(nn.Module):
         B = text_feats.size(0)
 
         # Broadcast so we can compare every text in the batch with every image
-        #text_feats = F.normalize(text_feats, dim=-1)
-        #visual_feats = F.normalize(visual_feats, dim=-1)
+        text_feats = F.normalize(text_feats, dim=-1)
+        visual_feats = F.normalize(visual_feats, dim=-1)
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
 
@@ -370,7 +371,9 @@ class MultiModalModel(nn.Module):
         # ------------------------------------------------------------
         # 1)  text → visual • max over patches, mean over tokens
         # ------------------------------------------------------------
-        t2v_max  = token_sims.max(dim=3).values                      # (B, B, Nt)
+        #t2v_max  = token_sims.max(dim=3).values                      # (B, B, Nt)
+        t2v_patch_weights = F.softmax(token_sims / self.tau, dim=3) 
+        t2v_max = (t2v_patch_weights * token_sims).sum(dim=3) # (B, B, Nt)
         t_mask   = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
         t2v_sum  = (t2v_max * t_mask).sum(dim=2)                     # (B, B)
         valid_t  = t_mask.sum(dim=2).clamp(min=1e-7)
@@ -379,7 +382,9 @@ class MultiModalModel(nn.Module):
         # ------------------------------------------------------------
         # 2)  visual → text • max over tokens, mean over patches
         # ------------------------------------------------------------
-        v2t_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
+        #v2t_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
+        v2t_token_weights = F.softmax(token_sims / self.tau, dim=2)
+        v2t_max = (v2t_token_weights * token_sims).sum(dim=2) # (B, B, Nv)
         v2t_clip = v2t_max.mean(dim=2)                               # (B, B)
 
         # ------------------------------------------------------------
@@ -422,10 +427,9 @@ class MultiModalModel(nn.Module):
         temp = self.temperature
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
                                - torch.log(temp), min=0) ** 2
-        #temp_high = torch.clamp(torch.log(temp) 
-         #                       - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
-        #l_cal = temp_low# + temp_high
-        return reg_loss + temp_low
+        temp_high = torch.clamp(torch.log(temp) - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
+        l_cal = temp_low + temp_high
+        return reg_loss + l_cal
 
     '''def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor): #sigmoid
         """
@@ -534,7 +538,9 @@ class MultiModalModel(nn.Module):
             "tv_neg_sim_mean": neg_sim_mean,
             "tv_neg_sim_std": neg_sim_std,
             "tv_separation": separation,
-            "tv_hardest_negative": hardest_negative
+            "tv_hardest_negative": hardest_negative,
+            "tv_contrastive_loss": contrastive_loss,
+            "tv_reg_loss": reg_loss
         }
         
         return total_loss, similarity_stats

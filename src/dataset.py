@@ -30,26 +30,21 @@ class LocalCaptionDataset(Dataset):
     def __init__(self, root_dir, split='train', transform=None):
         self.root_dir = Path(root_dir)
         self.transform = transform or transforms.Compose([
-            # Geometric transformations (on PIL image)
             transforms.RandomHorizontalFlip(),
-            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)), # Small translations
-            # Convert to tensor (0-1 range)
+            transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)), 
             transforms.ToTensor(),
-            # Color transformations (on tensor)
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            # Normalize with ImageNet stats
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                             std=[0.229, 0.224, 0.225])
-            #transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), # Optional: Random erasing at the end
+            #transforms.RandomErasing(p=0.2, scale=(0.02, 0.1)), 
         ])
         
-        # Clean transform for visualization
         self.clean_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], 
                             std=[0.229, 0.224, 0.225])
         ])
-
+        self.error_tensor = torch.zeros((3, 224, 224))
         self.image_files = []
         for subdir in self.root_dir.iterdir():
             if subdir.is_dir():
@@ -63,9 +58,10 @@ class LocalCaptionDataset(Dataset):
         txt_path = img_path.with_suffix('.txt')
         
         try:
-            image = Image.open(img_path).convert('RGB')
-            if self.transform:
-                image = self.transform(image)
+            with Image.open(img_path) as image:
+                image = image.convert('RGB')
+                if self.transform:
+                    image = self.transform(image)
             with open(txt_path, 'r') as f:
                 caption = f.read().strip()
                 
@@ -74,8 +70,8 @@ class LocalCaptionDataset(Dataset):
         except Exception as e:
             print(f"Error loading {img_path}: {str(e)}")
             import traceback
-            traceback.print_exc()  # This will show the full stack trace
-            return torch.zeros((3, 224, 224)), ""
+            traceback.print_exc()
+            return self.error_tensor, ""
 
 
 if __name__ == "__main__":
