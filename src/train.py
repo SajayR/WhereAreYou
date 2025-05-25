@@ -301,7 +301,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Duod-256-nolora-anneal-tempbound", config=self.config)
+            wandb.init(project=self.project_name, name="Duod-256-nolora-nonorm-hardmax-tempbound", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -428,14 +428,14 @@ class MultiModalTrainer:
         )
 
     #need to anneal tau from 0.15 to 0.07 in a fixed number of steps
-    def anneal_tau(self, current_step):
+    '''def anneal_tau(self, current_step):
         # Linear scaling from 0.15 to 0.07 during unfreeze_vit_step steps
         num_steps = 20000
         if current_step < num_steps:
             progress = current_step / num_steps
             self.model.tau = 0.30 - (0.30 - 0.05) * progress
         else:
-            self.model.tau = 0.05
+            self.model.tau = 0.05'''
 
     ###########################################
     #  Freeze/Unfreeze logic (Text Only)
@@ -621,6 +621,7 @@ class MultiModalTrainer:
             wandb.log(wandb_dict)
         del tv_results
         gc.collect()
+        self.model.train()
         self.logger.info("Done 1000-way retrieval evaluation.")
 
     ###########################################
@@ -651,7 +652,7 @@ class MultiModalTrainer:
 
             for batch_idx in pbar:
                 self._update_frozen_params(self.global_step)
-                self.anneal_tau(self.global_step)
+                #self.anneal_tau(self.global_step)
                 grad_norm_others = None
                 grad_norm_text = None
                 grad_norm_vit = None
@@ -691,9 +692,9 @@ class MultiModalTrainer:
                     text_grads = [p.grad.norm() for p in self.text_params if p.grad is not None]
                     vit_grads = [p.grad.norm() for p in self.vit_params if p.grad is not None]
 
-                    #grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
-                    #grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
-                    #grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
 
                     clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
                     clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
@@ -737,14 +738,14 @@ class MultiModalTrainer:
                         "lr_text": self.opt_text.param_groups[0]['lr'],
                         "lr_vit": self.opt_vit.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
-                        "tau": self.model.tau
+                        #"tau": self.model.tau
                     }
-                    #if grad_norm_others is not None:
-                    #    wandb_dict["grad_norm_others"] = grad_norm_others.item()
-                    #if grad_norm_text is not None:
-                     #   wandb_dict["grad_norm_text"] = grad_norm_text.item()
-                    #if grad_norm_vit is not None:
-                    #    wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
+                    if grad_norm_others is not None:
+                        wandb_dict["grad_norm_others"] = grad_norm_others.item()
+                    if grad_norm_text is not None:
+                        wandb_dict["grad_norm_text"] = grad_norm_text.item()
+                    if grad_norm_vit is not None:
+                        wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
                     try:
                         tv_sim_stats = {k: v.item() if torch.is_tensor(v) else float(v) for k, v in tv_sim_stats.items()}
                         wandb_dict.update(tv_sim_stats)
@@ -768,7 +769,9 @@ class MultiModalTrainer:
                     _, val_tv_loss, val_total_loss = self.validate(phase=phase)
                     print(f"Validation_Text_Visual: {f'{val_tv_loss:.4f}' if val_tv_loss is not None else 'N/A'}, " +
                           f"Validation_Total: {f'{val_total_loss:.4f}' if val_total_loss is not None else 'N/A'}")
+                    self.model.eval()
                     self.eval_1000_way_retrieval()
+                    self.model.train()
                 self.global_step += 1
                 
             epoch_loss = np.mean(epoch_losses)
@@ -776,6 +779,7 @@ class MultiModalTrainer:
             
             if self.val_tv_dataloader:
                 self.logger.info(f"Running validation after epoch {epoch}...")
+                self.model.eval()
                 _, val_tv_loss, val_total_loss = self.validate(phase=phase)
                 self.eval_1000_way_retrieval()
                 if val_total_loss is not None:
@@ -784,7 +788,8 @@ class MultiModalTrainer:
                         self.best_loss = val_total_loss
                         self.save_checkpoint(epoch, self.global_step, is_best=True)
                         self.logger.info(f"New best model saved with val_loss: {val_total_loss:.4f}")
-            
+                self.model.train()
+
             self.current_batch_idx = 0
             self.save_checkpoint(epoch, self.global_step)
 
@@ -800,7 +805,7 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-nolora-infonce-classic-annealing-tempbound",
+        output_dir="./outputs-nolora-nonorm-infonce-hardmax-tempbound",
         batch_size_tv=64,
         num_epochs=10,
         learning_rate=1e-3,
@@ -812,7 +817,7 @@ if __name__ == "__main__":
         device="cuda",
         gradient_accumulation_steps=4,
         unfreeze_text_step=5000,
-        unfreeze_vit_step=5000,
+        unfreeze_vit_step=7500,
         project_name="TriadIsdead",
         num_vis_samples_tv=60,
         use_amp=True,

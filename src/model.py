@@ -315,7 +315,7 @@ class MultiModalModel(nn.Module):
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
         self.amp_dtype = torch.bfloat16
-        self.tau = 0.07
+        #self.tau = 0.07
     ######################################################
     #               Shared Utilities
     ######################################################
@@ -327,8 +327,8 @@ class MultiModalModel(nn.Module):
         Returns sim: (B, N1, N2)
         """ 
         # ONLY NORMALIZE DURING INFERENCE, TRAINING CAUSES MODEL COLLAPSE
-        feats1 = F.normalize(feats1, dim=-1)
-        feats2 = F.normalize(feats2, dim=-1)
+        #feats1 = F.normalize(feats1, dim=-1)
+        #feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1, feats2.transpose(1, 2))
@@ -338,11 +338,12 @@ class MultiModalModel(nn.Module):
         ######################################################
     #               TEXT-VISUAL PATH
     ######################################################
-    def compute_all_similarities_tv(self,
+    '''def compute_all_similarities_tv(self, 
                                     text_feats:  torch.Tensor,
                                     visual_feats: torch.Tensor,
                                     attention_mask: torch.Tensor):
         """
+        Soft max over patches, mean over tokens
         Bidirectional max-mean aggregation (t → v and v → t).
 
         Parameters
@@ -359,8 +360,8 @@ class MultiModalModel(nn.Module):
         B = text_feats.size(0)
 
         # Broadcast so we can compare every text in the batch with every image
-        text_feats = F.normalize(text_feats, dim=-1)
-        visual_feats = F.normalize(visual_feats, dim=-1)
+        #text_feats = F.normalize(text_feats, dim=-1)
+        #visual_feats = F.normalize(visual_feats, dim=-1)
         tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Nt, D)
         vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
 
@@ -385,6 +386,60 @@ class MultiModalModel(nn.Module):
         #v2t_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
         v2t_token_weights = F.softmax(token_sims / self.tau, dim=2)
         v2t_max = (v2t_token_weights * token_sims).sum(dim=2) # (B, B, Nv)
+        v2t_clip = v2t_max.mean(dim=2)                               # (B, B)
+
+        # ------------------------------------------------------------
+        # 3)  symmetric similarity
+        # ------------------------------------------------------------
+        clip_sims = 0.5 * (t2v_clip + v2t_clip)                      # (B, B)
+
+        return clip_sims, token_sims'''
+    
+
+    def compute_all_similarities_tv(self,
+                                    text_feats:  torch.Tensor,
+                                    visual_feats: torch.Tensor,
+                                    attention_mask: torch.Tensor):
+        """
+        Hard max over patches, mean over tokens
+        Bidirectional max-mean aggregation (t → v and v → t).
+
+        Parameters
+        ----------
+        text_feats      : (B, Nt, D)   text-token embeddings
+        visual_feats    : (B, Nv, D)   visual-patch embeddings
+        attention_mask  : (B, Nt)      1 for real tokens, 0 for padding
+
+        Returns
+        -------
+        clip_sims  : (B, B)             symmetric similarity matrix
+        token_sims : (B, B, Nt, Nv)     raw token-level similarities
+        """
+        B = text_feats.size(0)
+
+        # Broadcast so we can compare every text in the batch with every image
+        #text_feats = F.normalize(text_feats, dim=-1)
+        #visual_feats = F.normalize(visual_feats, dim=-1)
+        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Nt, D)
+        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
+
+        # Full token-level similarity tensor
+        token_sims = torch.matmul(tf, vf.transpose(2, 3))           # (B, B, Nt, Nv)
+        token_sims = token_sims * self.temperature                   # scale by learned temp
+
+        # ------------------------------------------------------------
+        # 1)  text → visual • max over patches, mean over tokens
+        # ------------------------------------------------------------
+        t2v_max  = token_sims.max(dim=3).values                      # (B, B, Nt)
+        t_mask   = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
+        t2v_sum  = (t2v_max * t_mask).sum(dim=2)                     # (B, B)
+        valid_t  = t_mask.sum(dim=2).clamp(min=1e-7)
+        t2v_clip = t2v_sum / valid_t                                 # (B, B)
+
+        # ------------------------------------------------------------
+        # 2)  visual → text • max over tokens, mean over patches
+        # ------------------------------------------------------------
+        v2t_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
         v2t_clip = v2t_max.mean(dim=2)                               # (B, B)
 
         # ------------------------------------------------------------
