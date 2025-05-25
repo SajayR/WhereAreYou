@@ -72,6 +72,70 @@ class TextEmbedder(nn.Module):
         text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
         
         return text_feats, inputs["attention_mask"]
+    
+
+
+class TextLoRAEmbedder(nn.Module):
+    """
+    pre-trained BERT-like model to extract text features.
+    Projects them down to a desired embedding dimension.
+    """
+    def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base"):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.encoder = AutoModel.from_pretrained(model_name)
+        lora_config = LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=16,  # LoRA rank
+            lora_alpha=32,  # Alpha scaling
+            lora_dropout=0.1,
+            bias="none",
+            target_modules=["q_lin", "k_lin", "v_lin", "out_lin"]  # Specify target layers for LoRA
+        )
+        self.encoder = get_peft_model(self.encoder, lora_config)
+        self.projection1 = nn.Linear(self.encoder.config.hidden_size, 256)
+        self.layer_norm = nn.LayerNorm(256)
+        self.projection2 = nn.Linear(256, embedding_dim)
+        print("Using text model: ", model_name)
+        
+        # Set base model params to false, keep LoRA params trainable
+        for name, param in self.encoder.named_parameters():
+            if 'lora_' not in name:  # If not a LoRA parameter
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
+        for param in self.projection1.parameters():
+            param.requires_grad = True
+        for param in self.projection2.parameters():
+            param.requires_grad = True
+        
+    def forward(self, text_list):
+        """
+        Args:
+            text_list: List[str], batch of text inputs
+            
+        Returns:
+            text_feats: (B, Nt, D)
+            attention_mask: (B, Nt)
+        """
+        inputs = self.tokenizer(
+            text_list, 
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=128,
+            return_tensors="pt"
+        )
+        device = next(self.parameters()).device
+        for k in inputs:
+            inputs[k] = inputs[k].to(device)
+
+
+        outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
+        hidden_states = outputs.last_hidden_state
+        text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
+        
+        return text_feats, inputs["attention_mask"]
 
 
 #################################################################
@@ -171,7 +235,7 @@ class ViTLoRAEmbedder(nn.Module):
     Projects output embeddings to a common dimension with a linear layer.
     """
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=256, dropout_prob=0.1, lora_rank=8, lora_alpha=16):
+                 embedding_dim=256, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
         super().__init__()
         
         # Load the base model
@@ -202,8 +266,9 @@ class ViTLoRAEmbedder(nn.Module):
             target_modules=lora_target_modules,
             lora_dropout=0.0,
             fan_in_fan_out=True,  # Add this
-            bias="none",          # Add this
-            modules_to_save=None  # Add this to prevent parameter duplication
+            #bias="none",          # Add this
+            modules_to_save=None,  # Add this to prevent parameter duplication
+            
         )
         
         # Apply LoRA to the model
@@ -217,11 +282,11 @@ class ViTLoRAEmbedder(nn.Module):
         self.projection2 = nn.Linear(256, embedding_dim)
         self.patch_dropout_rate = dropout_prob
         self.patch_dropout = self.patch_dropout
-        for param in self.model.parameters():
-            param.requires_grad = True
-        #set base model to false
-        for param in self.model.base_model.parameters():
-            param.requires_grad = False
+        for name, param in self.model.named_parameters():
+            if 'lora_' not in name:  # If not a LoRA parameter
+                param.requires_grad = False
+            else:
+                param.requires_grad = True
         for param in self.projection1.parameters():
             param.requires_grad = True
         for param in self.projection2.parameters():
@@ -305,17 +370,18 @@ class MultiModalModel(nn.Module):
     ):
         super().__init__()
 
-        self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
-        #self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        #self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
+        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        self.text_embedder = TextLoRAEmbedder(embedding_dim=256, model_name=text_model_name)
         self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.05)
-        self.visual_embedder = ViTEmbedder(arch='dinov2_vits14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        #self.visual_embedder = ViTEmbedder(arch='dinov2_vits14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))
-       # self.bias = nn.Parameter(torch.tensor(-10.0))  # b₀ = −10 #only enable for sigmoid loss
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
         self.amp_dtype = torch.bfloat16
-        #self.tau = 0.07
+        #self.tau = 0.07 #only enable for softmax loss
+        #self.bias = nn.Parameter(torch.tensor(-10.0))  # b₀ = −10 #only enable for sigmoid loss
     ######################################################
     #               Shared Utilities
     ######################################################
@@ -330,9 +396,12 @@ class MultiModalModel(nn.Module):
         #feats1 = F.normalize(feats1, dim=-1)
         #feats2 = F.normalize(feats2, dim=-1)
         #always run in full precision
+        # Ensure computation in float32
+        feats1_f32 = feats1.float()
+        feats2_f32 = feats2.float()
         with torch.cuda.amp.autocast(enabled=False):
-            sim = torch.bmm(feats1, feats2.transpose(1, 2))
-            return sim * self.temperature
+            sim = torch.bmm(feats1_f32, feats2_f32.transpose(1, 2))
+            return (sim * self.temperature.float()).float()
 
 
         ######################################################

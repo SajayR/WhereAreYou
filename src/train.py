@@ -172,7 +172,7 @@ class MultiModalTrainer:
                 collate_fn=collate_text_fn,
                 pin_memory=True,
                 persistent_workers=(num_workers > 0),
-                prefetch_factor=8,
+                prefetch_factor=6,
                 drop_last=True
             )
             print("Validation LocalCaptionDataset loaded")
@@ -188,6 +188,8 @@ class MultiModalTrainer:
             visual_dropout_prob=0.10,
             use_amp=use_amp
         ).to(self.device)
+        self.model.to(dtype=torch.bfloat16)
+
         #enabling gradient checkpointing
         #self.model.audio_embedder.hubert.gradient_checkpointing_enable()
         #self.model.text_embedder.encoder.gradient_checkpointing_enable()
@@ -197,14 +199,17 @@ class MultiModalTrainer:
         #  3) Separate param groups => separate optimizers
         # -----------------------------------------------------
         self.text_params = []
-        #self.vit_lora_params = []
+        self.text_lora_params = []
+        self.vit_lora_params = []
         self.vit_params = []
         self.others_params = []
         for name, param in self.model.named_parameters():
-            if "text_embedder.encoder" in name:
+            if "text_embedder.encoder" in name and "lora" not in name:
                 self.text_params.append(param)
-            #elif "visual_embedder.model" in name and "lora" in name:
-            #    self.vit_lora_params.append(param)
+            elif "text_embedder.encoder" in name and "lora" in name:
+                self.text_lora_params.append(param)
+            elif "visual_embedder.model" in name and "lora" in name:
+                self.vit_lora_params.append(param)
             elif "visual_embedder.model" in name and "lora" not in name:
                 self.vit_params.append(param)
             else:
@@ -214,26 +219,43 @@ class MultiModalTrainer:
         print(f"Number of ViT parameters: {sum(p.numel() for p in self.vit_params):,}")
         print(f"Number of Text parameters: {sum(p.numel() for p in self.text_params):,}")
         print(f"Number of Other parameters: {sum(p.numel() for p in self.others_params):,}")
+        print(f"Number of ViT LoRA parameters: {sum(p.numel() for p in self.vit_lora_params):,}")
+        print(f"Number of Text LoRA parameters: {sum(p.numel() for p in self.text_lora_params):,}")
         #if len(self.vit_lora_params) == 0:
         #    print("WARNING: No LoRA parameters found! Check implementation.")
-
+        
+        # Print exact layer names for ViT parameters
+        print("\nViT parameter layer names:")
+        for name, param in self.model.named_parameters():
+            if "visual_embedder.model" in name and "lora" not in name:
+                print(f"  {name}")
+        
+        # Print exact layer names for ViT LoRA parameters
+        print("\nViT LoRA parameter layer names:")
+        for name, param in self.model.named_parameters():
+            if "visual_embedder.model" in name and "lora" in name:
+                print(f"  {name}")
         # Optimizer for "others"
         self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
         #self.opt_others = SOAP(params=self.others_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
         # Optimizer for text encoder (frozen at start)
-        self.opt_text = torch.optim.AdamW(self.text_params, lr=learning_rate*0.1)
+        self.opt_text = torch.optim.AdamW(self.text_lora_params, lr=learning_rate)
         #self.opt_text = SOAP(params=self.text_params, lr = 1e-4, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
         # Optimizer for vision (LoRA) parameters
-        self.opt_vit = torch.optim.AdamW(self.vit_params, lr=learning_rate*0.1)
+        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
         #self.opt_vit = SOAP(params=self.vit_lora_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
 
         # Freeze text parameters until reaching the unfreeze step
         for p in self.text_params:
             p.requires_grad = False
-        #for p in self.vit_lora_params:
-        #    p.requires_grad = True
         for p in self.vit_params:
             p.requires_grad = False
+        for p in self.text_lora_params:
+            p.requires_grad = True
+        for p in self.vit_lora_params:
+            p.requires_grad = True
+        
+        
 
         # -----------------------------------------------------
         #  4) Multiple OneCycle schedulers
@@ -301,7 +323,7 @@ class MultiModalTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Duod-256-nolora-nonorm-hardmax-tempbound", config=self.config)
+            wandb.init(project=self.project_name, name="Duod-256-bothlora-nonorm-hardmax-tempbound-gradclip2", config=self.config)
 
         # -----------------------------------------------------
         #  6) Visualization: Only text-visual
@@ -309,11 +331,11 @@ class MultiModalTrainer:
         self.text_viz = TextVisualizer()
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
 
-        '''print("Compiling model")
+        print("Compiling model")
         start_time = time.time()
         torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
         end_time = time.time()
-        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")'''
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
 
         self.logger.info("Initialized MultiModalTrainer for text-visual training.")
 
@@ -441,21 +463,23 @@ class MultiModalTrainer:
     #  Freeze/Unfreeze logic (Text Only)
     ###########################################
     def _update_frozen_params(self, current_step: int):
-        text_module = self.model.text_embedder.encoder
+        pass
+
+        '''text_module = self.model.text_embedder.encoder
         if current_step < self.config['unfreeze_text_step']:
             for p in text_module.parameters():
                 p.requires_grad = False
         else:
             for p in text_module.parameters():
-                p.requires_grad = True
+                p.requires_grad = True'''
 
-        visual_module = self.model.visual_embedder.model
-        if current_step < self.config['unfreeze_vit_step']:
-            for p in visual_module.parameters():
-                p.requires_grad = False
-        else:
-            for p in visual_module.parameters():
-                p.requires_grad = True
+        #visual_module = self.model.visual_embedder.model
+        #if current_step < self.config['unfreeze_vit_step']:
+         #   for p in visual_module.parameters():
+         #       p.requires_grad = False
+        #else:
+         #   for p in visual_module.parameters():
+         #       p.requires_grad = True
 
 
     ###########################################
@@ -501,7 +525,7 @@ class MultiModalTrainer:
         self.logger.info(f"Generating text visualization for epoch: {epoch}")
         self.model.eval()
         with torch.no_grad():
-            for i in range(len(self.vis_samples_tv["images"])):
+            for i in tqdm(range(len(self.vis_samples_tv["images"])), desc="Visualizing samples"):
                 frame = self.vis_samples_tv["images"][i].to(self.device)
                 text = self.vis_samples_tv["texts"][i]
                 out_file_img = self.output_dir / f"tv_viz_epoch{epoch}_sample{i}.png"
@@ -519,12 +543,12 @@ class MultiModalTrainer:
                         "visualization_phase": "text"
                     }, commit=True)
         self.model.train()
-        '''print("Compiling model")
+        print("Compiling model")
         start_time = time.time()
-        #torch.compile(self.model, mode="max-autotune")
+        
         torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
         end_time = time.time()
-        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")'''
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
         plt.close('all')
         gc.collect()
 
@@ -588,12 +612,12 @@ class MultiModalTrainer:
         self.model.train()
         del tv_losses, tv_sim_stats_list, avg_tv_sim_stats, tv_batch
         gc.collect()
-        '''print("Compiling model")
+        print("Compiling model")
         start_time = time.time()
-        #torch.compile(self.model, mode="max-autotune")
+        
         torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
         end_time = time.time()
-        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")'''
+        print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
         return None, avg_tv_loss, val_total_loss
     
 
@@ -629,40 +653,58 @@ class MultiModalTrainer:
     ###########################################
     def train(self):
         accumulation_counter = 0
-        wandb.watch(self.model, log="all")
+        #wandb.watch(self.model, log="all")
         for epoch in range(self.start_epoch, self.config['num_epochs']):
             #self.eval_1000_way_retrieval()
             #self.visualize_samples(epoch)
             phase = "text"
             self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Training")
             self.logger.info(f"Epoch {epoch} starting")
-            self.tv_iter = iter(self.tv_dataloader)
+            torch.manual_seed(42 + epoch + self.global_step)
+            np.random.seed(42 + epoch + self.global_step)
 
-            print(f"Resuming from batch {self.current_batch_idx}")
-            for _ in tqdm(range(self.current_batch_idx), desc="Resuming from checkpoint"):
-                try:
-                    next(self.tv_iter)
-                except StopIteration:
-                    self.tv_iter = iter(self.tv_dataloader)
-                    next(self.tv_iter)
-
-            max_steps = len(self.tv_dataloader)
-            pbar = tqdm(range(max_steps - self.current_batch_idx), desc=f"Epoch {epoch} ({phase})")
             epoch_losses = []
+            # Print trainable parameter stats
+            total_params = 0
+            trainable_params = 0
+            trainable_layers = []
 
-            for batch_idx in pbar:
+            for name, param in self.model.named_parameters():
+                total_params += param.numel()
+                if param.requires_grad:
+                    trainable_params += param.numel()
+                    if name not in trainable_layers:
+                        trainable_layers.append(name)
+
+            print(f"\nTrainable parameters: {trainable_params:,} / {total_params:,} "
+                  f"({100 * trainable_params / total_params:.2f}%)")
+            print(f"Trainable layers:\n" + "\n".join(trainable_layers) + "\n")
+            # Create a clone of the model's state before training
+            prev_state = {name: param.clone().detach() for name, param in self.model.named_parameters()}
+            
+            print(f"Resuming from batch {self.current_batch_idx}")
+            pbar = tqdm(enumerate(self.tv_dataloader), desc=f"Epoch {epoch} ({phase})", total=len(self.tv_dataloader))
+            for batch_idx, tv_batch in pbar:
+                # Skip batches for checkpoint resume
+                if batch_idx < self.current_batch_idx:
+                    continue
                 self._update_frozen_params(self.global_step)
                 #self.anneal_tau(self.global_step)
-                grad_norm_others = None
+                
+                # After first batch, check which layers were updated
+                if batch_idx == 20:
+                    print("\nLayers updated after first batch:")
+                    for name, param in self.model.named_parameters():
+                        if not torch.equal(param.data, prev_state[name]):
+                            print(f"- {name}")
+                    print() # Empty line for readability
                 grad_norm_text = None
+                grad_norm_text_lora = None
                 grad_norm_vit = None
+                grad_norm_vit_lora = None
+                grad_norm_others = None
+           
 
-                try:
-                    tv_batch = next(self.tv_iter)
-                except StopIteration:
-                    print("StopIteration in tv_iter")
-                    self.tv_iter = iter(self.tv_dataloader)
-                    tv_batch = next(self.tv_iter)
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv = tv_batch['captions']
                 try:
@@ -691,14 +733,18 @@ class MultiModalTrainer:
                     others_grads = [p.grad.norm() for p in self.others_params if p.grad is not None]
                     text_grads = [p.grad.norm() for p in self.text_params if p.grad is not None]
                     vit_grads = [p.grad.norm() for p in self.vit_params if p.grad is not None]
+                    text_grads_lora = [p.grad.norm() for p in self.text_lora_params if p.grad is not None]
+                    vit_grads_lora = [p.grad.norm() for p in self.vit_lora_params if p.grad is not None]
 
                     grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
                     grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
                     grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
+                    grad_norm_text_lora = torch.norm(torch.stack(text_grads_lora)) if text_grads_lora else torch.tensor(0.0, device=self.device)
+                    grad_norm_vit_lora = torch.norm(torch.stack(vit_grads_lora)) if vit_grads_lora else torch.tensor(0.0, device=self.device)
 
-                    clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
-                    clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
-
+                    #clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
+                    #clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
+                    clip_grad_norm_(self.model.parameters(), 2.0)
                     # Step each optimizer
                     self.opt_others.step()
                     self.opt_others.zero_grad()
@@ -746,6 +792,10 @@ class MultiModalTrainer:
                         wandb_dict["grad_norm_text"] = grad_norm_text.item()
                     if grad_norm_vit is not None:
                         wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
+                    if grad_norm_text_lora is not None:
+                        wandb_dict["grad_norm_text_lora"] = grad_norm_text_lora.item()
+                    if grad_norm_vit_lora is not None:
+                        wandb_dict["grad_norm_vit_lora"] = grad_norm_vit_lora.item()
                     try:
                         tv_sim_stats = {k: v.item() if torch.is_tensor(v) else float(v) for k, v in tv_sim_stats.items()}
                         wandb_dict.update(tv_sim_stats)
@@ -760,7 +810,7 @@ class MultiModalTrainer:
                 
                 if self.global_step % 500 == 0:
                     gc.collect()
-                if (self.global_step % self.vis_every == 0):
+                if (self.global_step % self.vis_every == 0) and (self.global_step > 0):
                     self.visualize_samples(epoch)
                 if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
@@ -805,8 +855,8 @@ if __name__ == "__main__":
     trainer = MultiModalTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-nolora-nonorm-infonce-hardmax-tempbound",
-        batch_size_tv=64,
+        output_dir="./outputs-bothlora-nonorm-infonce-hardmax-tempbound",
+        batch_size_tv=72,
         num_epochs=10,
         learning_rate=1e-3,
         use_wandb=True,
@@ -816,8 +866,8 @@ if __name__ == "__main__":
         num_workers=12,
         device="cuda",
         gradient_accumulation_steps=4,
-        unfreeze_text_step=5000,
-        unfreeze_vit_step=7500,
+        unfreeze_text_step=0,
+        unfreeze_vit_step=0,
         project_name="TriadIsdead",
         num_vis_samples_tv=60,
         use_amp=True,

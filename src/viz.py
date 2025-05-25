@@ -185,13 +185,18 @@ class TextVisualizer:
         CAP_FONT_SIZE = 18  # pt
         CAP_WRAP      = 45   # chars/line
         IMG_RATIO     = 5.0  # relative height of an image row
-        LINE_RATIO    = 0.28 # relative height contribution per caption line
+        LINE_RATIO    = 0.28 # reslative height contribution per caption line
         # ------------------------------------------------------------ #
 
         model.eval()
         with torch.no_grad():
-            vf = model.visual_embedder(frame.unsqueeze(0))
+            #frame = frame.unsqueeze(0)
+            #frame = frame.to(dtype=torch.bfloat16)
+            vf = model.visual_embedder(frame.unsqueeze(0).to(dtype=torch.bfloat16))
+            vf = vf.to(dtype=torch.float32)
             tf, mask = model.text_embedder([text])
+            mask = mask.to(dtype=torch.float32)
+            tf = tf.to(dtype=torch.float32)
             sims = model.compute_similarity_matrix(tf, vf).squeeze(0)[: int(mask.sum())]
 
         tokenizer = model.text_embedder.tokenizer

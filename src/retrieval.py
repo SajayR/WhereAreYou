@@ -108,14 +108,19 @@ def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
     with torch.no_grad():
         for batch_images, batch_captions in tqdm(loader, desc="Embedding TV subset"):
             batch_images = batch_images.to(device)
+            batch_images = batch_images.to(dtype=torch.bfloat16)
             vfeats = model.visual_embedder(batch_images)  # (B, Nv, D)
+            vfeats = vfeats.to(dtype=torch.float32)
+
             tfeats, attn_mask = model.text_embedder(batch_captions)  # (B, Nt, D), (B, Nt)
+            tfeats = tfeats.to(dtype=torch.float32)
+            attn_mask = attn_mask.to(dtype=torch.float32)
             vfeats = F.normalize(vfeats, dim=1)
             tfeats = F.normalize(tfeats, dim=1)
             B = vfeats.shape[0]
             for b in range(B):
                 # slice out valid tokens
-                n_tokens = attn_mask[b].sum().item()
+                n_tokens = int(attn_mask[b].sum().item())
                 text_feats_list[idx_offset + b] = tfeats[b, :n_tokens].cpu()
                 image_feats_list[idx_offset + b] = vfeats[b].cpu()
             idx_offset += B
