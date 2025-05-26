@@ -70,14 +70,14 @@ class TextEmbedder(nn.Module):
 
 
 class TextLoRAEmbedder(nn.Module):
-    def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base"):
+    def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base", lora_rank=16, lora_alpha=32):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.encoder = AutoModel.from_pretrained(model_name)
         lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
-            r=16,  
-            lora_alpha=32,  
+            r=lora_rank,  
+            lora_alpha=lora_alpha,  
             lora_dropout=0.1,
             bias="none",
             target_modules=["q_lin", "k_lin", "v_lin", "out_lin"]  
@@ -129,10 +129,6 @@ class TextLoRAEmbedder(nn.Module):
         
         return text_feats, inputs["attention_mask"]
 
-
-#################################################################
-#                   Visual Embedder
-#################################################################
 class ViTEmbedder(nn.Module):
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
                  embedding_dim=256, dropout_prob=0.1):
@@ -230,7 +226,7 @@ class ViTLoRAEmbedder(nn.Module):
             target_modules=lora_target_modules,
             lora_dropout=0.0,
             fan_in_fan_out=True,  
-            #bias="none",          
+            bias="none",          
             modules_to_save=None,  
             
         )
@@ -327,13 +323,17 @@ class DuoDModel(nn.Module):
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1,
-        use_amp=True
+        use_amp=True,
+        vit_lora_rank=16,
+        vit_lora_alpha=32,
+        text_lora_rank=16,
+        text_lora_alpha=32
     ):
         super().__init__()
 
         #self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
-        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
-        self.text_embedder = TextLoRAEmbedder(embedding_dim=256, model_name=text_model_name)
+        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob, lora_rank=vit_lora_rank, lora_alpha=vit_lora_alpha)
+        self.text_embedder = TextLoRAEmbedder(embedding_dim=256, model_name=text_model_name, lora_rank=text_lora_rank, lora_alpha=text_lora_alpha)
         self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.05)
         #self.visual_embedder = ViTEmbedder(arch='dinov2_vits14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
         self.temperature = nn.Parameter(torch.tensor(temperature))

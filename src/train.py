@@ -64,7 +64,11 @@ class DuoDTrainer:
         force_new_training: bool = False,
         use_amp: bool = True,
         text_dataset_val_path: str = None,
-        validation_frequency: int = 10000  
+        validation_frequency: int = 10000,
+        vit_lora_rank: int = 16,
+        vit_lora_alpha: int = 32,
+        text_lora_rank: int = 16,
+        text_lora_alpha: int = 32
     ):
         """
         Args:
@@ -166,7 +170,11 @@ class DuoDTrainer:
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.00,
             visual_dropout_prob=0.10,
-            use_amp=use_amp
+            use_amp=use_amp,
+            vit_lora_rank=vit_lora_rank,
+            vit_lora_alpha=vit_lora_alpha,
+            text_lora_rank=text_lora_rank,
+            text_lora_alpha=text_lora_alpha
         ).to(self.device)
 
         #self.model.to(dtype=torch.bfloat16)
@@ -821,7 +829,11 @@ if __name__ == "__main__":
         project_name="TriadIsdead",
         num_vis_samples_tv=60,
         use_amp=True,
-        validation_frequency=20000
+        validation_frequency=20000,
+        vit_lora_rank=16,
+        vit_lora_alpha=32,
+        text_lora_rank=16,
+        text_lora_alpha=32
     )
 
     trainer.train()
