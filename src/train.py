@@ -293,7 +293,7 @@ class DuoDTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name="Duod-256-bothlora-nonorm-hardmax-tempbound-gradclip2", config=self.config)
+            wandb.init(project=self.project_name, name=f"Duod-{vit_lora_rank}-{text_lora_rank}-{vit_lora_alpha}-{text_lora_alpha}", config=self.config)
 
         self.text_viz = TextVisualizer()
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
@@ -800,7 +800,7 @@ if __name__ == "__main__":
         gradient_accumulation_steps=4,
         unfreeze_text_step=0,
         unfreeze_vit_step=0,
-        project_name="TriadIsdead",
+        project_name="Duod",
         num_vis_samples_tv=60,
         use_amp=True,
         validation_frequency=20000,

@@ -120,7 +120,8 @@ class ViTEmbedder(nn.Module):
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
         self.patch_dropout_rate = dropout_prob
-        self.patch_dropout = self.patch_dropout
+        self.patch_dropout = self.patch_dropout_layer
+
         for name, param in self.model.named_parameters():
             if 'lora_' not in name:  # If not a LoRA parameter
                 param.requires_grad = False
@@ -131,38 +132,22 @@ class ViTEmbedder(nn.Module):
         for param in self.projection2.parameters():
             param.requires_grad = True
 
-    def patch_dropout(self, x, drop_rate):
+    def patch_dropout(self, x: torch.Tensor, drop_p: float):
         """
-        Args:
-            x: patch embeddings of shape (B, N, D) where N is number of patches
-            drop_rate: probability of dropping a patch
+        x : (B, N, D) 
         """
-        if not self.training or drop_rate == 0:
+        if not self.training or drop_p == 0:
             return x
-            
-        B, N, D = x.shape
-        dtype = x.dtype
-        keep_mask = torch.bernoulli(
-            torch.ones(B, N, device=x.device, dtype=dtype) * (1 - drop_rate)
-        ).bool()
-        output_tensors = []
 
-        for i in range(B):
-            kept_tokens = x[i][keep_mask[i]]
-            output_tensors.append(kept_tokens)
-        max_len = max(tensor.size(0) for tensor in output_tensors)
-        padded_outputs = []
-        
-        for tensor in output_tensors:
-            if tensor.size(0) < max_len:
-                padding = torch.zeros(max_len - tensor.size(0), D, dtype=dtype, device=x.device)
-                padded_outputs.append(torch.cat([tensor, padding], dim=0))
-            else:
-                padded_outputs.append(tensor)
-        
-        # Stack back into batch
-        x = torch.stack(padded_outputs, dim=0)
+        B, N, D = x.shape
+        # keep_mask shape (B, N, 1)
+        keep_mask = (torch.rand(B, N, 1, device=x.device) > drop_p)
+        x = x * keep_mask          # zero-out dropped patches
+        # (optional) renormalise so token magnitudes stay comparable
+        keep_counts = keep_mask.sum(dim=1, keepdim=True).clamp_min(1)
+        x = x * N / keep_counts
         return x
+
     
 
     def forward(self, x):
