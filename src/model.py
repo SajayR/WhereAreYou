@@ -97,16 +97,6 @@ class TextLoRAEmbedder(nn.Module):
         for param in self.projection2.parameters():
             param.requires_grad = True
     
-    @torch._dynamo.disable               
-    def _hf_tokenize(self, text_list):
-        return self.tokenizer(
-            text_list,
-            padding=True,
-            truncation=True,
-            add_special_tokens=False,
-            max_length=128,
-            return_tensors="pt"
-        )
         
     def forward(self, text_list):
         """
@@ -117,7 +107,14 @@ class TextLoRAEmbedder(nn.Module):
             text_feats: (B, Nt, D)
             attention_mask: (B, Nt)
         """
-        inputs = self._hf_tokenize(text_list)
+        inputs = self.tokenizer(
+            text_list,
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=128,
+            return_tensors="pt"
+        )
         device = next(self.parameters()).device
         for k in inputs:
             inputs[k] = inputs[k].to(device)
