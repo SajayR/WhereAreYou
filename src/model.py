@@ -28,7 +28,7 @@ class TextEmbedder(nn.Module):
     def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base", lora_rank=16, lora_alpha=32):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.encoder = AutoModel.from_pretrained(model_name)
+        self.encoder = AutoModel.from_pretrained(model_name, attn_implementation="flash_attention_2")
         lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             r=lora_rank,  
@@ -87,19 +87,28 @@ class ViTEmbedder(nn.Module):
                  embedding_dim=256, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
         super().__init__()
 
-        self.model = torch.hub.load(model_name, arch)
+        #self.model = torch.hub.load(model_name, arch)
+        self.model = AutoModel.from_pretrained('facebook/dinov2-base', attn_implementation="flash_attention_2")
+        # Print all layer names for debugging
+        #print("ViTEmbedder layer names:")
+        #for name, module in self.model.named_modules():
+        #    print(f"  {name}: {type(module).__name__}")
         print(f"Using DINOv2 model with LoRA adapters: {arch}")
         for param in self.model.parameters():
             param.requires_grad = False
 
         lora_target_modules = [
-            "attn.qkv",
-            "attn.proj",
-            #"mlp.fc1",
-            #"mlp.fc2",
+            "attention.attention.query",
+            "attention.attention.key",
+            "attention.attention.value",
+            "attention.output.dense",
+            # ff
+            # "mlp.fc1",
+            # "mlp.fc2",
         ]
+
         lora_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
+            #task_type=TaskType.FEATURE_EXTRACTION,
             inference_mode=False,
             r=lora_rank,
             lora_alpha=lora_alpha,
@@ -115,8 +124,10 @@ class ViTEmbedder(nn.Module):
         trainable_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         total_params = sum(p.numel() for p in self.model.parameters())
         print(f"ViTLoRAEmbedder - Trainable parameters: {trainable_params:,} ({100 * trainable_params / total_params:.2f}% of total)")
-
-        self.projection1 = nn.Linear(self.model.embed_dim, 256)
+        #print("Model config keys:")
+        #for key in self.model.config.__dict__.keys():
+        #    print(f"  {key}: {getattr(self.model.config, key)}")
+        self.projection1 = nn.Linear(self.model.config.hidden_size, 256)
         self.layer_norm = nn.LayerNorm(256)
         self.projection2 = nn.Linear(256, embedding_dim)
         self.patch_dropout_rate = dropout_prob
@@ -132,7 +143,7 @@ class ViTEmbedder(nn.Module):
         for param in self.projection2.parameters():
             param.requires_grad = True
 
-    def patch_dropout(self, x: torch.Tensor, drop_p: float):
+    def patch_dropout_layer(self, x: torch.Tensor, drop_p: float):
         """
         x : (B, N, D) 
         """
@@ -140,10 +151,8 @@ class ViTEmbedder(nn.Module):
             return x
 
         B, N, D = x.shape
-        # keep_mask shape (B, N, 1)
         keep_mask = (torch.rand(B, N, 1, device=x.device) > drop_p)
-        x = x * keep_mask          # zero-out dropped patches
-        # (optional) renormalise so token magnitudes stay comparable
+        x = x * keep_mask 
         keep_counts = keep_mask.sum(dim=1, keepdim=True).clamp_min(1)
         x = x * N / keep_counts
         return x
@@ -159,12 +168,15 @@ class ViTEmbedder(nn.Module):
                 Nv = number of visual tokens
                 D  = embedding_dim
         """
+        #print("x", x)
         if len(x.shape) == 5:  # [1, 1, 3, 224, 224]
             x = x.squeeze(0)  #  [1, 3, 224, 224]
         if len(x.shape) == 3:
             x = x.unsqueeze(0)
  
-        patches = self.model.get_intermediate_layers(x, n=1)[0]
+        outputs = self.model(pixel_values=x,return_dict=True,output_attentions=False, output_hidden_states=False)
+        patches = outputs.last_hidden_state[:,1:, :]
+        #print("patches", patches.shape)
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
         feats = self.patch_dropout(feats, self.patch_dropout_rate)
         
@@ -188,6 +200,10 @@ class DuoDModel(nn.Module):
 
         self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob, lora_rank=vit_lora_rank, lora_alpha=vit_lora_alpha)
         self.text_embedder = TextEmbedder(embedding_dim=256, model_name=text_model_name, lora_rank=text_lora_rank, lora_alpha=text_lora_alpha)
+        
+        #self.visual_embedder.model = torch.compile(self.visual_embedder.model, mode="reduce-overhead")
+        #self.text_embedder.encoder = torch.compile(self.text_embedder.encoder,   mode="reduce-overhead")
+        
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
@@ -366,29 +382,24 @@ class DuoDModel(nn.Module):
 if __name__ == "__main__":
     print("Testing MultiModalModel with random inputs...")
     model = DuoDModel(
-        audio_model_name="facebook/hubert-base-ls960",
         text_model_name="distilbert/distilbert-base-uncased",
         temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.2
-    )
+    ).to("cuda")
     batch_size = 2
     dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames
-    dummy_audio  = torch.randn(batch_size, 16000)            # 1 sec of 16kHz
+    dummy_frames = dummy_frames.to("cuda").to(torch.bfloat16)
     dummy_texts  = ["a man riding a bicycle", "a cat on a bed"]
     model.train()
-    av_loss, _, _, _, _ = model.forward_audio_visual(dummy_frames, dummy_audio)
-    print(f"Audio-Visual loss: {av_loss.item():.4f}")
     tv_loss, _ = model.forward_text_visual(dummy_frames, dummy_texts)
     print(f"Text-Visual loss: {tv_loss.item():.4f}")
     model.eval()
-    with torch.no_grad():
-        av_sims = model.forward_audio_visual(dummy_frames, dummy_audio)
-        print(f"Audio-Visual similarities shape: {av_sims.shape}")  
+    with torch.no_grad(): 
         # expected => (B, Na, Nv)
-        tv_sims, tv_mask = model.forward_text_visual(dummy_frames, dummy_texts)
-        print(f"Text-Visual similarities shape: {tv_sims.shape}, mask: {tv_mask.shape}")
+        loss, stats = model.forward_text_visual(dummy_frames, dummy_texts)
+        print(f"Text-Visual loss: {loss.item():.4f}")
         # expected => (B, Nt, Nv), (B, Nt)
     
     print("MultiModalModel test completed.")
