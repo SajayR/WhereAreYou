@@ -20,10 +20,16 @@ from model import MultiModalModel
 from viz import TextVisualizer
 from retrieval import compute_tv_retrieval_metrics
 warnings.filterwarnings("ignore")
+
 import time
 #from soap import SOAP
 # Disable tokenizer parallelism warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+import torch._dynamo
+# allow dynamic-shape operators like nonzero
+#torch._dynamo.config.capture_dynamic_output_shape_ops = True
+torch._dynamo.config.capture_scalar_outputs = True   # lets you keep .item() if you prefer
+#torch._inductor.config.max_autotune_gemm = False     # silences the “Not enough SMs” warning
 
 ###########################################
 #         Collate for the Text Dataset
@@ -333,10 +339,17 @@ class MultiModalTrainer:
 
         print("Compiling model")
         start_time = time.time()
-        torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
+        #self.model = torch.compile(self.model, mode="max-autotune", fullgraph=True, backend="inductor")
+        self.model.forward_text_visual = torch.compile(
+            self.model.forward_text_visual,
+            mode="max-autotune",
+            fullgraph=True,
+            backend="inductor",
+            dynamic=True
+        )
+        
         end_time = time.time()
         print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
-
         self.logger.info("Initialized MultiModalTrainer for text-visual training.")
 
 
@@ -821,11 +834,14 @@ class MultiModalTrainer:
                 
                 if self.global_step % 500 == 0:
                     gc.collect()
-                if (self.global_step % self.vis_every == 0) and (self.global_step > 0):
-                    self.visualize_samples(epoch)
+                
                 if (self.global_step > 0) and (self.global_step % self.save_every_steps == 0):
                     self.current_batch_idx = batch_idx + 1
                     self.save_checkpoint(epoch, self.global_step)
+                
+                if (self.global_step % self.vis_every == 0) and (self.global_step > 0):
+                    self.visualize_samples(epoch)
+                
                 if self.global_step > 0 and self.global_step % self.validation_frequency == 0:
                     _, val_tv_loss, val_total_loss = self.validate(phase=phase)
                     print(f"Validation_Text_Visual: {f'{val_tv_loss:.4f}' if val_tv_loss is not None else 'N/A'}, " +
@@ -870,8 +886,8 @@ if __name__ == "__main__":
         batch_size_tv=72,
         num_epochs=10,
         learning_rate=1e-3,
-        use_wandb=True,
-        force_new_training=False,
+        use_wandb=False,
+        force_new_training=True,
         vis_every=10000,
         save_every_steps=10000,
         num_workers=12,

@@ -20,6 +20,7 @@ from peft import (
     get_peft_model,
     TaskType,
 )
+import torch._dynamo
 
 
 #################################################################
@@ -108,6 +109,17 @@ class TextLoRAEmbedder(nn.Module):
             param.requires_grad = True
         for param in self.projection2.parameters():
             param.requires_grad = True
+    
+    @torch._dynamo.disable               # ① graph-break decorator
+    def _hf_tokenize(self, text_list):
+        return self.tokenizer(
+            text_list,
+            padding=True,
+            truncation=True,
+            add_special_tokens=False,
+            max_length=128,
+            return_tensors="pt"
+        )
         
     def forward(self, text_list):
         """
@@ -118,14 +130,7 @@ class TextLoRAEmbedder(nn.Module):
             text_feats: (B, Nt, D)
             attention_mask: (B, Nt)
         """
-        inputs = self.tokenizer(
-            text_list, 
-            padding=True,
-            truncation=True,
-            add_special_tokens=False,
-            max_length=128,
-            return_tensors="pt"
-        )
+        inputs = self._hf_tokenize(text_list)
         device = next(self.parameters()).device
         for k in inputs:
             inputs[k] = inputs[k].to(device)
@@ -292,7 +297,7 @@ class ViTLoRAEmbedder(nn.Module):
         for param in self.projection2.parameters():
             param.requires_grad = True
 
-    def patch_dropout(self, x, drop_rate):
+    '''def patch_dropout(self, x, drop_rate):
         """
         Actually removes patch embeddings during training
         Args:
@@ -332,7 +337,19 @@ class ViTLoRAEmbedder(nn.Module):
         
         # Stack back into batch
         x = torch.stack(padded_outputs, dim=0)
-        return x
+        return x'''
+    
+    def patch_dropout(self, x: torch.Tensor, drop_rate: float):
+        """
+        Mask out (zero) random patches instead of removing them.
+        Shape stays (B, N, D) so `torch.compile` can build one graph.
+        """
+        if not self.training or drop_rate == 0:
+            return x
+        B, N, D = x.shape
+        keep = torch.rand(B, N, device=x.device) > drop_rate      # bool mask
+        return x * keep.unsqueeze(-1)        # broadcast over the D dim
+
 
     def forward(self, x):
         """
@@ -518,7 +535,6 @@ class MultiModalModel(nn.Module):
 
         return clip_sims, token_sims
 
-
     def compute_regularization_losses_tv(self, token_sims):
         """
         1) negative sims near zero
@@ -631,6 +647,7 @@ class MultiModalModel(nn.Module):
         mask.fill_diagonal_(0)
         neg_sims = clip_sims[mask]  # Shape: (B*(B-1),)
         
+        
         # Compute statistics
         pos_sim_mean = pos_sims.mean().item()
         pos_sim_std = pos_sims.std().item()
@@ -668,6 +685,7 @@ class MultiModalModel(nn.Module):
         }
         
         return total_loss, similarity_stats
+
 
 
     def forward_text_visual(self, frames, text_list):
