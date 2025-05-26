@@ -55,7 +55,7 @@ class DuoDTrainer:
         unfreeze_text_step: int = 5000,
         unfreeze_vit_step: int = 8000,
         use_wandb: bool = True,
-        project_name: str = "UnifiedTextVisual",
+        project_name: str = "sumnsumn",
         vis_every: int = 1000,
         num_vis_samples_tv: int = 10,
         save_every_steps: int = 10000,
@@ -676,7 +676,7 @@ class DuoDTrainer:
 
                     #clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
                     #clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
-                    clip_grad_norm_(self.model.parameters(), 2.0)
+                    clip_grad_norm_(self.model.parameters(), 0.1)
                     self.opt_others.step()
                     self.opt_others.zero_grad()
                     if self.step_others < self.total_updates:

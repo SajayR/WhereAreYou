@@ -28,7 +28,7 @@ class TextEmbedder(nn.Module):
     def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base", lora_rank=16, lora_alpha=32):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.encoder = AutoModel.from_pretrained(model_name, attn_implementation="flash_attention_2")
+        self.encoder = AutoModel.from_pretrained(model_name)#, attn_implementation="flash_attention_2")
         lora_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             r=lora_rank,  
@@ -88,7 +88,7 @@ class ViTEmbedder(nn.Module):
         super().__init__()
 
         #self.model = torch.hub.load(model_name, arch)
-        self.model = AutoModel.from_pretrained('facebook/dinov2-base', attn_implementation="flash_attention_2")
+        self.model = AutoModel.from_pretrained('facebook/dinov2-base')#, attn_implementation="flash_attention_2")
         # Print all layer names for debugging
         #print("ViTEmbedder layer names:")
         #for name, module in self.model.named_modules():
@@ -200,10 +200,7 @@ class DuoDModel(nn.Module):
 
         self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob, lora_rank=vit_lora_rank, lora_alpha=vit_lora_alpha)
         self.text_embedder = TextEmbedder(embedding_dim=256, model_name=text_model_name, lora_rank=text_lora_rank, lora_alpha=text_lora_alpha)
-        
-        #self.visual_embedder.model = torch.compile(self.visual_embedder.model, mode="reduce-overhead")
-        #self.text_embedder.encoder = torch.compile(self.text_embedder.encoder,   mode="reduce-overhead")
-        
+
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
@@ -330,11 +327,11 @@ class DuoDModel(nn.Module):
         
         similarity_stats = {
             "tv_pos_sim_mean": pos_sim_mean,
-            "tv_pos_sim_std": pos_sim_std,
+            #"tv_pos_sim_std": pos_sim_std,
             "tv_neg_sim_mean": neg_sim_mean,
-            "tv_neg_sim_std": neg_sim_std,
+            #"tv_neg_sim_std": neg_sim_std,
             "tv_separation": separation,
-            "tv_hardest_negative": hardest_negative,
+            #"tv_hardest_negative": hardest_negative,
             "tv_contrastive_loss": contrastive_loss,
             "tv_reg_loss": reg_loss
         }
