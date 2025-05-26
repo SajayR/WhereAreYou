@@ -289,7 +289,7 @@ class DuoDModel(nn.Module):
                                - torch.log(temp), min=0) ** 2
         temp_high = torch.clamp(torch.log(temp) - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
         l_cal = temp_low + temp_high
-        return l_nonneg + 0.4*l_cal
+        return l_nonneg + 0.1*l_cal
 
         
     def compute_contrastive_loss_tv(self, clip_sims, token_sims): #infonce
@@ -332,8 +332,8 @@ class DuoDModel(nn.Module):
             #"tv_neg_sim_std": neg_sim_std,
             "tv_separation": separation,
             #"tv_hardest_negative": hardest_negative,
-            "tv_contrastive_loss": contrastive_loss,
-            "tv_reg_loss": reg_loss
+            #"tv_contrastive_loss": contrastive_loss,
+            "reg_loss": reg_loss
         }
         
         return total_loss, similarity_stats

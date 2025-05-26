@@ -167,7 +167,7 @@ class DuoDTrainer:
 
         self.model = DuoDModel(
             text_model_name="distilbert/distilbert-base-uncased",
-            temperature=1.5,
+            temperature=1.2,
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.00,
             visual_dropout_prob=0.10,
@@ -365,7 +365,6 @@ class DuoDTrainer:
 
         self.vis_samples_tv = ck["vis_samples_tv"]
         self.best_loss = ck["best_loss"]
-        self._update_frozen_params(self.global_step)
         del ck
 
         self.logger.info(
@@ -524,6 +523,7 @@ class DuoDTrainer:
             total_params = 0
             trainable_params = 0
             trainable_layers = []
+            accumulated_loss = 0.0 # Initialize accumulated loss
 
             for name, param in self.model.named_parameters():
                 total_params += param.numel()
@@ -599,19 +599,18 @@ class DuoDTrainer:
 
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
-                pbar.set_postfix({"loss": f"{loss_val:.4f}", "phase": phase})
+                pbar.set_postfix({"loss": f"{loss_val:.4f}"})
 
                 if self.use_wandb:
                     wandb_dict = {
                         "train_loss": loss_val,
-                        "loss_tv": tv_loss.item() if tv_loss is not None else 0.0,
+                        #"loss_tv": tv_loss.item() if tv_loss is not None else 0.0,
                         "epoch": epoch,
                         "global_step": self.global_step,
-                        "training_phase": phase,
                         "lr": self.optimizer.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
-                        #"tau": self.model.tau
                     }
+                    
                     if grad_norm_trainable is not None:
                         wandb_dict["grad_norm"] = grad_norm_trainable.item()
                     
@@ -689,7 +688,7 @@ if __name__ == "__main__":
     parser.add_argument("--text_lora_rank", type=int, default=16)
     parser.add_argument("--text_lora_alpha",type=int, default=32)
     # training knobs
-    parser.add_argument("--num_epochs",     type=int, default=10)
+    parser.add_argument("--num_epochs",     type=int, default=5)
     parser.add_argument("--learning_rate",  type=float,default=1e-3)
     parser.add_argument("--batch_size_tv",  type=int, default=64)
     # misc
