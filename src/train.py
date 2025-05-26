@@ -56,6 +56,7 @@ class DuoDTrainer:
         unfreeze_vit_step: int = 8000,
         use_wandb: bool = True,
         project_name: str = "sumnsumn",
+        run_name: str = "sumnrun",
         vis_every: int = 1000,
         num_vis_samples_tv: int = 10,
         save_every_steps: int = 10000,
@@ -201,49 +202,50 @@ class DuoDTrainer:
             else:
                 self.others_params.append(param)
 
-        #print(f"Number of LoRA parameters: {len(self.vit_lora_params)}")
-        print(f"Number of ViT parameters: {sum(p.numel() for p in self.vit_params):,}")
-        print(f"Number of Text parameters: {sum(p.numel() for p in self.text_params):,}")
+        self.base_text_params = self.text_params
+        self.base_vit_params = self.vit_params
+        self.trainable_params = self.text_lora_params + self.vit_lora_params + self.others_params
+        
+        print(f"Number of Base ViT parameters: {sum(p.numel() for p in self.base_vit_params):,}")
+        print(f"Number of Base Text parameters: {sum(p.numel() for p in self.base_text_params):,}")
         print(f"Number of Other parameters: {sum(p.numel() for p in self.others_params):,}")
         print(f"Number of ViT LoRA parameters: {sum(p.numel() for p in self.vit_lora_params):,}")
         print(f"Number of Text LoRA parameters: {sum(p.numel() for p in self.text_lora_params):,}")
-        #if len(self.vit_lora_params) == 0:
-        #    print("WARNING: No LoRA parameters found! Check implementation.")
-        
+        print(f"Total trainable parameters: {sum(p.numel() for p in self.trainable_params):,}")
 
-        print("\nViT parameter layer names:")
+        print("Base ViT parameter layer names:")
         for name, param in self.model.named_parameters():
             if "visual_embedder.model" in name and "lora" not in name:
                 print(f"  {name}")
-        print("\nViT LoRA parameter layer names:")
+        print("ViT LoRA parameter layer names:")
         for name, param in self.model.named_parameters():
             if "visual_embedder.model" in name and "lora" in name:
                 print(f"  {name}")
-        
-        self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
-        #self.opt_others = SOAP(params=self.others_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
-        
-        self.opt_text = torch.optim.AdamW(self.text_lora_params, lr=learning_rate)
-        #self.opt_text = SOAP(params=self.text_params, lr = 1e-4, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
-        
-        self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
-        #self.opt_vit = SOAP(params=self.vit_lora_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
+        print("Base Text parameter layer names:")
+        for name, param in self.model.named_parameters():
+            if "text_embedder.encoder" in name and "lora" not in name:
+                print(f"  {name}")
+        print("Text LoRA parameter layer names:")
+        for name, param in self.model.named_parameters():
+            if "text_embedder.encoder" in name and "lora" in name:
+                print(f"  {name}")
 
-        for p in self.text_params:
+        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=learning_rate)
+
+        # Set requires_grad for all parameters
+        for p in self.base_text_params:
             p.requires_grad = False
-        for p in self.vit_params:
+        for p in self.base_vit_params:
             p.requires_grad = False
-        for p in self.text_lora_params:
-            p.requires_grad = True
-        for p in self.vit_lora_params:
+        for p in self.trainable_params:
             p.requires_grad = True
         
         total_steps_per_epoch = len(self.tv_dataloader)
         self.steps_per_epoch = total_steps_per_epoch
         self.total_updates = (total_steps_per_epoch * num_epochs) // self.gradient_accumulation_steps
 
-        self.sched_others = torch.optim.lr_scheduler.OneCycleLR(
-            self.opt_others,
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
             max_lr=learning_rate,
             total_steps=self.total_updates,
             pct_start=0.1,
@@ -251,30 +253,8 @@ class DuoDTrainer:
             final_div_factor=1e4,
             anneal_strategy='cos'
         )
-        text_cycle = max(1, self.total_updates - unfreeze_text_step)
-        self.sched_text = torch.optim.lr_scheduler.OneCycleLR(
-            self.opt_text,
-            max_lr=learning_rate*0.5,
-            total_steps=text_cycle,
-            pct_start=0.1,
-            div_factor=10,
-            final_div_factor=1e4,
-            anneal_strategy='cos'
-        )
-        vit_cycle = max(1, self.total_updates - unfreeze_vit_step)
-        self.sched_vit = torch.optim.lr_scheduler.OneCycleLR(
-            self.opt_vit,
-            max_lr=learning_rate,
-            total_steps=vit_cycle,
-            pct_start=0.1,
-            div_factor=10,
-            final_div_factor=1e4,
-            anneal_strategy='cos'
-        )
 
-        self.step_others = 0
-        self.step_text = 0
-        self.step_vit = 0
+        self.scheduler_step_count = 0 
         self.start_epoch = 0
         self.global_step = 0
         self.current_batch_idx = 0
@@ -293,7 +273,7 @@ class DuoDTrainer:
                 print("No checkpoint found")
         
         if self.use_wandb and wandb.run is None:
-            wandb.init(project=self.project_name, name=f"Duod-{vit_lora_rank}-{text_lora_rank}-{vit_lora_alpha}-{text_lora_alpha}", config=self.config)
+            wandb.init(project=self.project_name, name=run_name, config=self.config)
 
         self.text_viz = TextVisualizer()
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
@@ -330,15 +310,9 @@ class DuoDTrainer:
             "current_batch_idx": self.current_batch_idx,
             "rng_state": rng_state,
             "model_state_dict": self.model._orig_mod.state_dict() if hasattr(self.model, '_orig_mod') else self.model.state_dict(),
-            "opt_others_state": self.opt_others.state_dict(),
-            "opt_text_state": self.opt_text.state_dict(),
-            "opt_vit_state": self.opt_vit.state_dict(),
-            "sched_others_state": self.sched_others.state_dict(),
-            "sched_text_state": self.sched_text.state_dict(),
-            "sched_vit_state": self.sched_vit.state_dict(),
-            "sched_step_others": self.step_others,
-            "sched_step_text": self.step_text,
-            "sched_step_vit": self.step_vit,
+            "optimizer_state": self.optimizer.state_dict(),
+            "scheduler_state": self.scheduler.state_dict(),
+            "scheduler_step_count": self.scheduler_step_count,
             "best_loss": self.best_loss,
             "config": self.config,
             "vis_samples_tv": self.vis_samples_tv
@@ -367,15 +341,9 @@ class DuoDTrainer:
             self.model.load_state_dict(clean_state_dict)
         else:
             self.model.load_state_dict(ck["model_state_dict"])
-        self.opt_others.load_state_dict(ck["opt_others_state"])
-        self.opt_text.load_state_dict(ck["opt_text_state"])
-        self.opt_vit.load_state_dict(ck["opt_vit_state"])
-        self.sched_others.load_state_dict(ck["sched_others_state"])
-        self.sched_text.load_state_dict(ck["sched_text_state"])
-        self.sched_vit.load_state_dict(ck["sched_vit_state"])
-        self.step_others = ck.get("sched_step_others", 0)
-        self.step_text = ck.get("sched_step_text", 0)
-        self.step_vit = ck.get("sched_step_vit", 0)
+        self.optimizer.load_state_dict(ck["optimizer_state"])
+        self.scheduler.load_state_dict(ck["scheduler_state"])
+        self.scheduler_step_count = ck.get("scheduler_step_count", 0)
         self.start_epoch = ck["epoch"]
         self.global_step = ck["step"] #+1 because we already did one step in the main loop
         self.current_batch_idx = ck.get("current_batch_idx", 0)
@@ -405,39 +373,6 @@ class DuoDTrainer:
             f"batch_offset={self.current_batch_idx})"
         )
 
-    #need to anneal tau from 0.15 to 0.07 in a fixed number of steps
-    '''def anneal_tau(self, current_step):
-        # Linear scaling from 0.15 to 0.07 during unfreeze_vit_step steps
-        num_steps = 20000
-        if current_step < num_steps:
-            progress = current_step / num_steps
-            self.model.tau = 0.30 - (0.30 - 0.05) * progress
-        else:
-            self.model.tau = 0.05'''
-
-    def _update_frozen_params(self, current_step: int):
-        pass
-
-        '''text_module = self.model.text_embedder.encoder
-        if current_step < self.config['unfreeze_text_step']:
-            for p in text_module.parameters():
-                p.requires_grad = False
-        else:
-            for p in text_module.parameters():
-                p.requires_grad = True'''
-
-        #visual_module = self.model.visual_embedder.model
-        #if current_step < self.config['unfreeze_vit_step']:
-         #   for p in visual_module.parameters():
-         #       p.requires_grad = False
-        #else:
-         #   for p in visual_module.parameters():
-         #       p.requires_grad = True
-
-
-    ###########################################
-    #     Visualization logic (Text-Visual)
-    ###########################################
     def _get_tv_vis_samples(self, n_samples=2, use_val=False):
         
         dataset = self.val_tv_dataset if use_val and self.val_tv_dataset else self.tv_dataset
@@ -549,9 +484,7 @@ class DuoDTrainer:
         return None, avg_tv_loss, val_total_loss
     
     def eval_1000_way_retrieval(self):
-        """
-        1000-way ret
-        """
+
         if not self.val_tv_dataset:
             self.logger.info("No 1000-way retrieval possible, no validation set loaded.")
             return
@@ -580,13 +513,12 @@ class DuoDTrainer:
         accumulation_counter = 0
         #wandb.watch(self.model, log="all")
         for epoch in range(self.start_epoch, self.config['num_epochs']):
-            #self.eval_1000_way_retrieval()
-            #self.visualize_samples(epoch)
+ 
             phase = "text"
             self.logger.info(f"Epoch {epoch} - Phase: Text-Visual Training")
             self.logger.info(f"Epoch {epoch} starting")
-            torch.manual_seed(42 + epoch + self.global_step)
-            np.random.seed(42 + epoch + self.global_step)
+            torch.manual_seed(69 + epoch + self.global_step)
+            np.random.seed(69 + epoch + self.global_step)
 
             epoch_losses = []
             total_params = 0
@@ -610,8 +542,6 @@ class DuoDTrainer:
             for batch_idx, tv_batch in pbar:
                 if batch_idx < self.current_batch_idx:
                     continue
-                self._update_frozen_params(self.global_step)
-                #self.anneal_tau(self.global_step)
         
                 if batch_idx == 20:
                     print("\nLayers updated after first batch:")
@@ -619,11 +549,7 @@ class DuoDTrainer:
                         if not torch.equal(param.data, prev_state[name]):
                             print(f"- {name}")
                     print() 
-                grad_norm_text = None
-                grad_norm_text_lora = None
-                grad_norm_vit = None
-                grad_norm_vit_lora = None
-                grad_norm_others = None
+                grad_norm_trainable = None
            
 
                 frames_tv = tv_batch['images'].to(self.device)
@@ -634,18 +560,14 @@ class DuoDTrainer:
                 except torch.cuda.OutOfMemoryError:
                     print("Out of memory error in forward_text_visual")
                     self.model.zero_grad()
-                    self.opt_others.zero_grad()
-                    self.opt_text.zero_grad()
-                    self.opt_vit.zero_grad()
+                    self.optimizer.zero_grad()
                     torch.cuda.empty_cache()
                     gc.collect()
                     continue
                 except Exception as e:
                     print(f"Error in forward_text_visual: {e}")
                     self.model.zero_grad()
-                    self.opt_others.zero_grad()
-                    self.opt_text.zero_grad()
-                    self.opt_vit.zero_grad()
+                    self.optimizer.zero_grad()
                     torch.cuda.empty_cache()
                     gc.collect()
                     continue
@@ -662,43 +584,18 @@ class DuoDTrainer:
                 accumulation_counter += 1
 
                 if (accumulation_counter % self.gradient_accumulation_steps) == 0:
-                    others_grads = [p.grad.norm() for p in self.others_params if p.grad is not None]
-                    text_grads = [p.grad.norm() for p in self.text_params if p.grad is not None]
-                    vit_grads = [p.grad.norm() for p in self.vit_params if p.grad is not None]
-                    text_grads_lora = [p.grad.norm() for p in self.text_lora_params if p.grad is not None]
-                    vit_grads_lora = [p.grad.norm() for p in self.vit_lora_params if p.grad is not None]
+                    # Calculate grad norm for all trainable parameters
+                    trainable_grads = [p.grad.norm() for p in self.trainable_params if p.grad is not None]
+                    grad_norm_trainable = torch.norm(torch.stack(trainable_grads)) if trainable_grads else torch.tensor(0.0, device=self.device)
 
-                    grad_norm_others = torch.norm(torch.stack(others_grads)) if others_grads else torch.tensor(0.0, device=self.device)
-                    grad_norm_text = torch.norm(torch.stack(text_grads)) if text_grads else torch.tensor(0.0, device=self.device)
-                    grad_norm_vit = torch.norm(torch.stack(vit_grads)) if vit_grads else torch.tensor(0.0, device=self.device)
-                    grad_norm_text_lora = torch.norm(torch.stack(text_grads_lora)) if text_grads_lora else torch.tensor(0.0, device=self.device)
-                    grad_norm_vit_lora = torch.norm(torch.stack(vit_grads_lora)) if vit_grads_lora else torch.tensor(0.0, device=self.device)
-
-                    #clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
-                    #clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
-                    clip_grad_norm_(self.model.parameters(), 0.1)
-                    self.opt_others.step()
-                    self.opt_others.zero_grad()
-                    if self.step_others < self.total_updates:
-                        self.sched_others.step()
-                        self.step_others += 1
-
-                    if self.global_step >= self.config['unfreeze_text_step']:
-                        self.opt_text.step()
-                        self.opt_text.zero_grad()
-                        if self.step_text < (self.total_updates - self.config['unfreeze_text_step']):
-                            self.sched_text.step()
-                            self.step_text += 1
-                    else:
-                        self.opt_text.zero_grad()
-                    if self.global_step >= self.config['unfreeze_vit_step']:
-                        self.opt_vit.step()
-                        self.opt_vit.zero_grad()
-                        if self.step_vit < (self.total_updates - self.config['unfreeze_vit_step']):
-                            self.sched_vit.step()
-                            self.step_vit += 1
-                    else:
-                        self.opt_vit.zero_grad()
+                    clip_grad_norm_(self.trainable_params, 2) # Clip gradients for trainable parameters
+                    
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    
+                    if self.scheduler_step_count < self.total_updates:
+                        self.scheduler.step()
+                        self.scheduler_step_count += 1
 
                 loss_val = loss_total.item()
                 epoch_losses.append(loss_val)
@@ -711,22 +608,13 @@ class DuoDTrainer:
                         "epoch": epoch,
                         "global_step": self.global_step,
                         "training_phase": phase,
-                        "lr_others": self.opt_others.param_groups[0]['lr'],
-                        "lr_text": self.opt_text.param_groups[0]['lr'],
-                        "lr_vit": self.opt_vit.param_groups[0]['lr'],
+                        "lr": self.optimizer.param_groups[0]['lr'],
                         "temperature": self.model.temperature.item(),
                         #"tau": self.model.tau
                     }
-                    if grad_norm_others is not None:
-                        wandb_dict["grad_norm_others"] = grad_norm_others.item()
-                    if grad_norm_text is not None:
-                        wandb_dict["grad_norm_text"] = grad_norm_text.item()
-                    if grad_norm_vit is not None:
-                        wandb_dict["grad_norm_vit"] = grad_norm_vit.item()
-                    if grad_norm_text_lora is not None:
-                        wandb_dict["grad_norm_text_lora"] = grad_norm_text_lora.item()
-                    if grad_norm_vit_lora is not None:
-                        wandb_dict["grad_norm_vit_lora"] = grad_norm_vit_lora.item()
+                    if grad_norm_trainable is not None:
+                        wandb_dict["grad_norm"] = grad_norm_trainable.item()
+                    
                     try:
                         tv_sim_stats = {k: v.item() if torch.is_tensor(v) else float(v) for k, v in tv_sim_stats.items()}
                         wandb_dict.update(tv_sim_stats)
@@ -778,36 +666,72 @@ class DuoDTrainer:
             self.save_checkpoint(epoch, self.global_step)
 
         self.logger.info("Training complete!")
+        done_file = self.output_dir / "done.txt"
+        with open(done_file, "w") as f:
+            f.write("finished\n")
+        self.logger.info(f"Training finished – wrote {done_file}")
+
 
 
 
 if __name__ == "__main__":
-    print("Starting text-visual training...")
+    import argparse, json, sys
+    parser = argparse.ArgumentParser()
+    # data / IO
+    parser.add_argument("--text_dataset_path",      default="/home/cis/cc3m-ironic")
+    parser.add_argument("--text_dataset_val_path",  default="/home/cis/cc3m-ironic-val")
+    parser.add_argument("--output_dir",             default=None,
+                        help="Each sweep run should have its own dir.")
+    parser.add_argument("--run_name", type=str, default="Duod")
+    # LoRA sweep knobs
+    parser.add_argument("--vit_lora_rank",  type=int, default=16)
+    parser.add_argument("--vit_lora_alpha", type=int, default=32)
+    parser.add_argument("--text_lora_rank", type=int, default=16)
+    parser.add_argument("--text_lora_alpha",type=int, default=32)
+    # training knobs
+    parser.add_argument("--num_epochs",     type=int, default=10)
+    parser.add_argument("--learning_rate",  type=float,default=1e-3)
+    parser.add_argument("--batch_size_tv",  type=int, default=64)
+    # misc
+    parser.add_argument("--force_new", action="store_true",
+                        help="Start fresh, ignore any checkpoints in output_dir")
+
+    args = parser.parse_args()
+
+    # -------------------------------------------------------------------------
+    # derive a *unique* output folder if the caller hasn't specified one
+    # ./runs/rank{rank}_alpha{alpha}  (e.g. ./runs/rank32_alpha64)
+    if args.output_dir is None:
+        args.output_dir = (
+            f"./runs/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
+        )
 
     trainer = DuoDTrainer(
-        text_dataset_path="/home/cis/cc3m-ironic",
-        text_dataset_val_path="/home/cis/cc3m-ironic-val",
-        output_dir="./outputs-bothlora-nonorm-infonce-hardmax-tempbound",
-        batch_size_tv=72,
-        num_epochs=10,
-        learning_rate=1e-3,
-        use_wandb=False,
-        force_new_training=True,
+        text_dataset_path=args.text_dataset_path,
+        text_dataset_val_path=args.text_dataset_val_path,
+        output_dir=args.output_dir,
+        num_epochs=args.num_epochs,
+        learning_rate=args.learning_rate,
+        batch_size_tv=args.batch_size_tv,
+        vit_lora_rank=args.vit_lora_rank,
+        vit_lora_alpha=args.vit_lora_alpha,
+        text_lora_rank=args.text_lora_rank,
+        text_lora_alpha=args.text_lora_alpha,
+        force_new_training=args.force_new,
+        run_name=args.run_name,
+        use_wandb=True,
         vis_every=10000,
-        save_every_steps=10000,
+        save_every_steps=5000,
         num_workers=12,
         device="cuda",
         gradient_accumulation_steps=4,
         unfreeze_text_step=0,
         unfreeze_vit_step=0,
         project_name="Duod",
-        num_vis_samples_tv=60,
+        num_vis_samples_tv=64,
         use_amp=True,
         validation_frequency=20000,
-        vit_lora_rank=16,
-        vit_lora_alpha=32,
-        text_lora_rank=16,
-        text_lora_alpha=32
+        
     )
 
     trainer.train()
