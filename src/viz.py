@@ -192,7 +192,7 @@ class TextVisualizer:
         with torch.no_grad():
             #frame = frame.unsqueeze(0)
             #frame = frame.to(dtype=torch.bfloat16)
-            vf = model.visual_embedder(frame.unsqueeze(0).to(dtype=torch.bfloat16))
+            vf = model.visual_embedder(frame.unsqueeze(0))#.to(dtype=torch.bfloat16))
             vf = vf.to(dtype=torch.float32)
             tf, mask = model.text_embedder([text])
             mask = mask.to(dtype=torch.float32)

@@ -188,7 +188,7 @@ class MultiModalTrainer:
             visual_dropout_prob=0.10,
             use_amp=use_amp
         ).to(self.device)
-        self.model.to(dtype=torch.bfloat16)
+        #self.model.to(dtype=torch.bfloat16)
 
         #enabling gradient checkpointing
         #self.model.audio_embedder.hubert.gradient_checkpointing_enable()
@@ -708,7 +708,8 @@ class MultiModalTrainer:
                 frames_tv = tv_batch['images'].to(self.device)
                 texts_tv = tv_batch['captions']
                 try:
-                    tv_loss, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
+                    with torch.amp.autocast(device_type=self.device, dtype=torch.bfloat16):
+                        tv_loss, tv_sim_stats = self.model.forward_text_visual(frames_tv, texts_tv)
                 except torch.cuda.OutOfMemoryError:
                     print("Out of memory error in forward_text_visual")
                     self.model.zero_grad()
@@ -718,6 +719,16 @@ class MultiModalTrainer:
                     torch.cuda.empty_cache()
                     gc.collect()
                     continue
+                except Exception as e:
+                    print(f"Error in forward_text_visual: {e}")
+                    self.model.zero_grad()
+                    self.opt_others.zero_grad()
+                    self.opt_text.zero_grad()
+                    self.opt_vit.zero_grad()
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    continue
+
                 tv_sim_stats = {
                     k: (v.item() if torch.is_tensor(v) else float(v))
                     for k, v in tv_sim_stats.items()
