@@ -21,55 +21,10 @@ from peft import (
     TaskType,
 )
 import torch._dynamo
+ 
 
 
 class TextEmbedder(nn.Module):
-    def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base"):
-        super().__init__()
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.encoder = AutoModel.from_pretrained(model_name)
-        self.projection1 = nn.Linear(self.encoder.config.hidden_size, 256)
-        self.layer_norm = nn.LayerNorm(256)
-        self.projection2 = nn.Linear(256, embedding_dim)
-        print("Using text model: ", model_name)
-        
-        for param in self.encoder.parameters():
-            param.requires_grad = True
-        for param in self.projection1.parameters():
-            param.requires_grad = True
-        for param in self.projection2.parameters():
-            param.requires_grad = True
-        
-    def forward(self, text_list):
-        """
-        Args:
-            text_list: List[str], batch of text inputs
-            
-        Returns:
-            text_feats: (B, Nt, D)
-            attention_mask: (B, Nt)
-        """
-        inputs = self.tokenizer(
-            text_list, 
-            padding=True,
-            truncation=True,
-            add_special_tokens=False,
-            max_length=128,
-            return_tensors="pt"
-        )
-        device = next(self.parameters()).device
-        for k in inputs:
-            inputs[k] = inputs[k].to(device)
-
-        outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
-        hidden_states = outputs.last_hidden_state
-        text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
-        
-        return text_feats, inputs["attention_mask"]
-    
-
-
-class TextLoRAEmbedder(nn.Module):
     def __init__(self, embedding_dim=256, model_name="answerdotai/ModernBERT-base", lora_rank=16, lora_alpha=32):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -127,78 +82,6 @@ class TextLoRAEmbedder(nn.Module):
         return text_feats, inputs["attention_mask"]
 
 class ViTEmbedder(nn.Module):
-    def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
-                 embedding_dim=256, dropout_prob=0.1):
-        super().__init__()
-        self.model = torch.hub.load(model_name, arch)
-        print("Using DINOv2 model: ", arch)
-        self.projection1 = nn.Linear(self.model.embed_dim, 256)
-        self.layer_norm = nn.LayerNorm(256)
-        self.projection2 = nn.Linear(256, embedding_dim)
-        #self.dropout = nn.Dropout(dropout_prob)
-        self.patch_dropout_rate = dropout_prob
-        self.patch_dropout = self.patch_dropout
-        for param in self.model.parameters():
-            param.requires_grad = True
-        for param in self.projection1.parameters():
-            param.requires_grad = True
-        for param in self.projection2.parameters():
-            param.requires_grad = True
-
-    def patch_dropout(self, x, drop_rate):
-        """
-
-        Args:
-            x: patch embeddings of shape (B, N, D) where N is number of patches
-            drop_rate: probability of dropping a patch
-        """
-        if not self.training or drop_rate == 0:
-            return x
-            
-        B, N, D = x.shape
-        dtype = x.dtype
-        keep_mask = torch.bernoulli(
-            torch.ones(B, N, device=x.device, dtype=dtype) * (1 - drop_rate)
-        ).bool()
-        output_tensors = []
-        for i in range(B):
-            kept_tokens = x[i][keep_mask[i]]
-            output_tensors.append(kept_tokens)
-        max_len = max(tensor.size(0) for tensor in output_tensors)
-        padded_outputs = []
-        
-        for tensor in output_tensors:
-            if tensor.size(0) < max_len:
-                padding = torch.zeros(max_len - tensor.size(0), D, dtype=dtype, device=x.device)
-                padded_outputs.append(torch.cat([tensor, padding], dim=0))
-            else:
-                padded_outputs.append(tensor)
-        x = torch.stack(padded_outputs, dim=0)
-        return x
-
-    def forward(self, x):
-        """
-        Args:
-            x: (B, 3, H, W)
-        Returns:
-            visual_feats: (B, Nv, D)
-                Nv = number of visual tokens
-                D  = embedding_dim
-        """
- 
-        if len(x.shape) == 5:  # [1, 1, 3, 224, 224]
-            x = x.squeeze(0)  # [1, 3, 224, 224]
-        if len(x.shape) == 3:
-            x = x.unsqueeze(0)
-        patches = self.model.get_intermediate_layers(x, n=1)[0]  
-        
-        feats = self.projection2(self.layer_norm(self.projection1(patches)))
-        #feats = self.dropout(feats)
-        feats = self.patch_dropout(feats, self.patch_dropout_rate)
-        #print(f"feats shape: {feats.shape}")
-        return feats
-
-class ViTLoRAEmbedder(nn.Module):
 
     def __init__(self, model_name='facebookresearch/dinov2', arch='dinov2_vitb14',
                  embedding_dim=256, dropout_prob=0.1, lora_rank=16, lora_alpha=32):
@@ -221,7 +104,7 @@ class ViTLoRAEmbedder(nn.Module):
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
-            lora_dropout=0.0,
+            lora_dropout=0.1,
             fan_in_fan_out=True,  
             bias="none",          
             modules_to_save=None,  
@@ -248,7 +131,7 @@ class ViTLoRAEmbedder(nn.Module):
         for param in self.projection2.parameters():
             param.requires_grad = True
 
-    '''def patch_dropout(self, x, drop_rate):
+    def patch_dropout(self, x, drop_rate):
         """
         Args:
             x: patch embeddings of shape (B, N, D) where N is number of patches
@@ -279,15 +162,8 @@ class ViTLoRAEmbedder(nn.Module):
         
         # Stack back into batch
         x = torch.stack(padded_outputs, dim=0)
-        return x'''
+        return x
     
-    def patch_dropout(self, x: torch.Tensor, drop_rate: float):
-        if not self.training or drop_rate == 0:
-            return x
-        B, N, D = x.shape
-        keep = torch.rand(B, N, device=x.device) > drop_rate      # bool mask
-        return x * keep.unsqueeze(-1)        # broadcast over the D dim
-
 
     def forward(self, x):
         """
@@ -309,9 +185,6 @@ class ViTLoRAEmbedder(nn.Module):
         
         return feats
 
-#################################################################
-#                   Unified MultiModalModel
-#################################################################
 class DuoDModel(nn.Module):
     def __init__(
         self, 
@@ -328,18 +201,13 @@ class DuoDModel(nn.Module):
     ):
         super().__init__()
 
-        #self.text_embedder  = TextEmbedder(embedding_dim=256, model_name=text_model_name)
-        self.visual_embedder = ViTLoRAEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob, lora_rank=vit_lora_rank, lora_alpha=vit_lora_alpha)
-        self.text_embedder = TextLoRAEmbedder(embedding_dim=256, model_name=text_model_name, lora_rank=text_lora_rank, lora_alpha=text_lora_alpha)
-        self.null_patch = nn.Parameter(torch.randn(1, 1, 256) * 0.05)
-        #self.visual_embedder = ViTEmbedder(arch='dinov2_vits14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob)
+        self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob, lora_rank=vit_lora_rank, lora_alpha=vit_lora_alpha)
+        self.text_embedder = TextEmbedder(embedding_dim=256, model_name=text_model_name, lora_rank=text_lora_rank, lora_alpha=text_lora_alpha)
         self.temperature = nn.Parameter(torch.tensor(temperature))
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
         self.amp_dtype = torch.bfloat16
-        #self.tau = 0.07 #only enable for softmax loss
-        #self.bias = nn.Parameter(torch.tensor(-10.0))  # b₀ = −10 #only enable for sigmoid loss
 
     def compute_similarity_matrix(self, feats1, feats2):
         """
@@ -358,60 +226,6 @@ class DuoDModel(nn.Module):
             sim = torch.bmm(feats1_f32, feats2_f32.transpose(1, 2))
             return (sim * self.temperature.float()).float()
 
-
-    '''
-    def compute_all_similarities_tv(self, 
-                                    text_feats:  torch.Tensor,
-                                    visual_feats: torch.Tensor,
-                                    attention_mask: torch.Tensor):
-        """
-        Soft max over patches, mean over tokens
-        Bidirectional max-mean aggregation (t → v and v → t).
-
-        Parameters
-        ----------
-        text_feats      : (B, Nt, D)   
-        visual_feats    : (B, Nv, D)   
-        attention_mask  : (B, Nt)      
-
-        Returns
-        -------
-        clip_sims  : (B, B)             
-        token_sims : (B, B, Nt, Nv)     
-        """
-        B = text_feats.size(0)
-
-        # Broadcast so we can compare every text in the batch with every image
-        #text_feats = F.normalize(text_feats, dim=-1)
-        #visual_feats = F.normalize(visual_feats, dim=-1)
-        tf = text_feats.unsqueeze(1).expand(-1, B, -1, -1)          # (B, B, Nt, D)
-        vf = visual_feats.unsqueeze(0).expand(B, -1, -1, -1)        # (B, B, Nv, D)
-        token_sims = torch.matmul(tf, vf.transpose(2, 3))           # (B, B, Nt, Nv)
-        token_sims = token_sims * self.temperature                   # scale by learned temp
-
-        # ------------------------------------------------------------
-        # 1)  text → visual • max over patches, mean over tokens
-        # ------------------------------------------------------------
-        #t2v_max  = token_sims.max(dim=3).values                      # (B, B, Nt)
-        t2v_patch_weights = F.softmax(token_sims / self.tau, dim=3) 
-        t2v_max = (t2v_patch_weights * token_sims).sum(dim=3) # (B, B, Nt)
-        t_mask   = attention_mask.unsqueeze(1).float().expand(-1, B, -1)
-        t2v_sum  = (t2v_max * t_mask).sum(dim=2)                     # (B, B)
-        valid_t  = t_mask.sum(dim=2).clamp(min=1e-7)
-        t2v_clip = t2v_sum / valid_t                                 # (B, B)
-
-        # ------------------------------------------------------------
-        # 2)  visual → text • max over tokens, mean over patches
-        # ------------------------------------------------------------
-        #v2t_max  = token_sims.max(dim=2).values                      # (B, B, Nv)
-        v2t_token_weights = F.softmax(token_sims / self.tau, dim=2)
-        v2t_max = (v2t_token_weights * token_sims).sum(dim=2) # (B, B, Nv)
-        v2t_clip = v2t_max.mean(dim=2)                               # (B, B)
-
-        clip_sims = 0.5 * (t2v_clip + v2t_clip)                      # (B, B)
-
-        return clip_sims, token_sims'''
-    
 
     def compute_all_similarities_tv(self,
                                     text_feats:  torch.Tensor,
@@ -465,97 +279,20 @@ class DuoDModel(nn.Module):
         return clip_sims, token_sims
 
     def compute_regularization_losses_tv(self, token_sims):
-        """
-        1) negative sims near zero
-        2) patch usage sparsity on positive pairs
-        """
+ 
         # (B, B, Nt, Nv)
         B = token_sims.shape[0]
-        # 1) negative clamp
+        # negative clamp
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims**2)
-        # 2) patch usage sparsity (for the diagonal pairs only)
-        positive_sims = []
-        for i in range(B):
-            # shape (Nt, Nv) from token_sims[i, i]
-            positive_sims.append(token_sims[i, i])
-        if len(positive_sims) == 0:
-            return 0.15 * l_nonneg
-            
-        positive_sims = torch.stack(positive_sims, dim=0)  # (B, Nt, Nv)
-        # softmax over patches => (B, Nt, Nv)
-        patch_probs = F.softmax(positive_sims, dim=-1)
-        # fraction usage per patch => sum over Nt, then / Nt => (B, Nv)
-        patch_fraction = patch_probs.sum(dim=1) / patch_probs.shape[1]
-        # penalize if fraction > threshold
-        excess = F.relu(patch_fraction - self.patch_sparsity_threshold)  # (B, Nv)
-        loss_sparsity = (excess ** 2).mean()
-        reg_loss = 0.15 * l_nonneg + self.patch_sparsity_weight * loss_sparsity
-
         #temp constraints
         temp = self.temperature
         temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
                                - torch.log(temp), min=0) ** 2
         temp_high = torch.clamp(torch.log(temp) - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
         l_cal = temp_low + temp_high
-        return reg_loss + l_cal
+        return l_nonneg + 0.4*l_cal
 
-    '''def compute_contrastive_loss_tv(self, clip_sims: torch.Tensor, token_sims: torch.Tensor):
-        """
-        Pair-wise sigmoid loss for text-visual alignment.
-
-        Parameters
-        ----------
-        clip_sims : (B, B)   cosine-similarity matrix between every text in the batch
-                            and every image in the batch (higher = more similar)
-        token_sims: (B, B, Nt, Nv) token-level similarity tensor (needed only for the
-                    regularisation term carried over from the original code)
-
-        Returns
-        -------
-        total_loss        : scalar torch tensor
-        similarity_stats  : dict of useful monitoring statistics
-        """
-        B = clip_sims.size(0)
-
-        
-        # labels  zᵢⱼ  are +1 for matching pairs, −1 otherwise
-        
-        labels = torch.full_like(clip_sims, -1.0)
-        labels.fill_diagonal_(1.0)           # positives on the main diagonal
-
-        
-        # pair-wise sigmoid loss
-        #    L = − log σ( z · (s + b) )
-        
-        logits        = clip_sims + self.bias      # broadcast learnable bias b
-        pairwise_loss = -F.logsigmoid(labels * logits).mean()
-
-        
-        reg_loss   = self.compute_regularization_losses_tv(token_sims)
-        total_loss = pairwise_loss + reg_loss
-
-        diag_mask        = torch.eye(B, dtype=torch.bool, device=clip_sims.device)
-        pos_sims         = clip_sims[diag_mask]         # positives
-        neg_sims         = clip_sims[~diag_mask]        # negatives
-
-        pos_sim_mean     = pos_sims.mean().item()
-        pos_sim_std      = pos_sims.std().item()
-        neg_sim_mean     = neg_sims.mean().item()
-        neg_sim_std      = neg_sims.std().item()
-        hardest_negative = neg_sims.max().item()
-        separation       = pos_sim_mean - neg_sim_mean  # mean gap
-
-        similarity_stats = {
-            "tv_pos_sim_mean": pos_sim_mean,
-            "tv_pos_sim_std":  pos_sim_std,
-            "tv_neg_sim_mean": neg_sim_mean,
-            "tv_neg_sim_std":  neg_sim_std,
-            "tv_separation":   separation,
-            "tv_hardest_negative": hardest_negative,
-        }
-
-        return total_loss, similarity_stats'''
         
     def compute_contrastive_loss_tv(self, clip_sims, token_sims): #infonce
         
@@ -609,30 +346,12 @@ class DuoDModel(nn.Module):
         with torch.cuda.amp.autocast(enabled=self.use_amp, dtype=self.amp_dtype):
             visual_feats = self.visual_embedder(frames)           # (B, Nv, D)
             B = visual_feats.size(0)
-            null_tok = self.null_patch.expand(B, -1, -1)          # (B, 1, D)
-            visual_feats = torch.cat([visual_feats, null_tok], dim=1)  # (B, Nv+1, D)
-            null_index = visual_feats.size(1) - 1                
+                      
             text_feats, attn_mask = self.text_embedder(text_list)  # (B, Nt, D)
             clip_sims, token_sims = self.compute_all_similarities_tv(
                 text_feats, visual_feats, attn_mask
             )
             loss, stats = self.compute_contrastive_loss_tv(clip_sims, token_sims)
-            with torch.no_grad():
-                pos_token_sims = token_sims[torch.arange(B), torch.arange(B)]  # (B,Nt,Nv+1)
-                max_idx = pos_token_sims.argmax(dim=-1)                        # (B,Nt)
-                null_hits = (max_idx == null_index).float()
-                null_frac = null_hits.mean()                                   # scalar
-
-                null_scores = pos_token_sims[..., null_index]                  # (B,Nt)
-                best_scores = pos_token_sims.max(dim=-1).values                # (B,Nt)
-                margin_over_null = (best_scores - null_scores).mean()
-
-            stats.update({
-                "tv_null_frac": null_frac.item(),
-                "tv_margin_over_null": margin_over_null.item(),
-            })
-            
-
             return loss, stats
 
     def forward(self, frames=None, text_list=None):
@@ -661,7 +380,7 @@ class DuoDModel(nn.Module):
 
 if __name__ == "__main__":
     print("Testing MultiModalModel with random inputs...")
-    model = MultiModalModel(
+    model = DuoDModel(
         audio_model_name="facebook/hubert-base-ls960",
         text_model_name="distilbert/distilbert-base-uncased",
         temperature=2.0,
