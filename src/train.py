@@ -16,50 +16,34 @@ from torch.nn.utils import clip_grad_norm_
 from torchvision import transforms
 import torch.nn as nn
 from dataset import LocalCaptionDataset
-from model import MultiModalModel
+from model import DuoDModel
 from viz import TextVisualizer
 from retrieval import compute_tv_retrieval_metrics
 warnings.filterwarnings("ignore")
-
 import time
-#from soap import SOAP
-# Disable tokenizer parallelism warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import torch._dynamo
-# allow dynamic-shape operators like nonzero
-#torch._dynamo.config.capture_dynamic_output_shape_ops = True
-torch._dynamo.config.capture_scalar_outputs = True   # lets you keep .item() if you prefer
-#torch._inductor.config.max_autotune_gemm = False     # silences the “Not enough SMs” warning
 
-###########################################
-#         Collate for the Text Dataset
-###########################################
+
+
 def collate_text_fn(batch):
     """
-    Simple collate function for the LocalCaptionDataset.
     Returns:
     {
        'images': (B, 3, 224, 224),
        'captions': list[str] of length B
     }
     """
-    images, captions = zip(*batch)  # from the dataset's __getitem__
-    images = torch.stack(images)    # shape => (B, 3, 224, 224)
+    images, captions = zip(*batch)
+    images = torch.stack(images)    # (B, 3, 224, 224)
     return {
         'images': images,
         'captions': list(captions)
     }
 
 
-###########################################
-#         Trainer Class (Text-Visual Only)
-###########################################
-class MultiModalTrainer:
-    """
-    Trainer for text-visual training.
-    Uses separate optimizers and schedulers for the non-specialized parameters,
-    for the text encoder and for the vision (LoRA) parameters.
-    """
+
+class DuoDTrainer:
+
     def __init__(
         self,
         text_dataset_path: str,
@@ -79,9 +63,8 @@ class MultiModalTrainer:
         device: str = "cuda",
         force_new_training: bool = False,
         use_amp: bool = True,
-        # Validation parameters
         text_dataset_val_path: str = None,
-        validation_frequency: int = 10000  # Run validation every N steps
+        validation_frequency: int = 10000  
     ):
         """
         Args:
@@ -134,9 +117,6 @@ class MultiModalTrainer:
         self.logger = logging.getLogger(__name__)
         self.use_amp = use_amp
 
-        # -----------------------------------------------------
-        #  1) Datasets / Dataloaders
-        # -----------------------------------------------------
         print("Loading LocalCaptionDataset...")
         self.tv_dataset = LocalCaptionDataset(text_dataset_path)
         self.tv_dataloader = DataLoader(
@@ -153,9 +133,6 @@ class MultiModalTrainer:
         print("LocalCaptionDataset loaded")
         self.tv_iter = None
 
-        # -----------------------------------------------------
-        #  1.1) Validation Dataset / Dataloader
-        # -----------------------------------------------------
         self.val_tv_dataset = None
         self.val_tv_dataloader = None
 
@@ -183,10 +160,7 @@ class MultiModalTrainer:
             )
             print("Validation LocalCaptionDataset loaded")
 
-        # -----------------------------------------------------
-        #  2) Model (Text & Vision Only)
-        # -----------------------------------------------------
-        self.model = MultiModalModel(
+        self.model = DuoDModel(
             text_model_name="distilbert/distilbert-base-uncased",
             temperature=1.5,
             patch_sparsity_threshold=0.80,
@@ -194,6 +168,7 @@ class MultiModalTrainer:
             visual_dropout_prob=0.10,
             use_amp=use_amp
         ).to(self.device)
+
         #self.model.to(dtype=torch.bfloat16)
 
         #enabling gradient checkpointing
@@ -201,9 +176,6 @@ class MultiModalTrainer:
         #self.model.text_embedder.encoder.gradient_checkpointing_enable()
         #1self.model.visual_embedder.model.gradient_checkpointing = True
 
-        # -----------------------------------------------------
-        #  3) Separate param groups => separate optimizers
-        # -----------------------------------------------------
         self.text_params = []
         self.text_lora_params = []
         self.vit_lora_params = []
@@ -230,28 +202,25 @@ class MultiModalTrainer:
         #if len(self.vit_lora_params) == 0:
         #    print("WARNING: No LoRA parameters found! Check implementation.")
         
-        # Print exact layer names for ViT parameters
+
         print("\nViT parameter layer names:")
         for name, param in self.model.named_parameters():
             if "visual_embedder.model" in name and "lora" not in name:
                 print(f"  {name}")
-        
-        # Print exact layer names for ViT LoRA parameters
         print("\nViT LoRA parameter layer names:")
         for name, param in self.model.named_parameters():
             if "visual_embedder.model" in name and "lora" in name:
                 print(f"  {name}")
-        # Optimizer for "others"
+        
         self.opt_others = torch.optim.AdamW(self.others_params, lr=learning_rate)
         #self.opt_others = SOAP(params=self.others_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
-        # Optimizer for text encoder (frozen at start)
+        
         self.opt_text = torch.optim.AdamW(self.text_lora_params, lr=learning_rate)
         #self.opt_text = SOAP(params=self.text_params, lr = 1e-4, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
-        # Optimizer for vision (LoRA) parameters
+        
         self.opt_vit = torch.optim.AdamW(self.vit_lora_params, lr=learning_rate)
         #self.opt_vit = SOAP(params=self.vit_lora_params, lr = 3e-3, betas=(.95, .95), weight_decay=.01, precondition_frequency=10)
 
-        # Freeze text parameters until reaching the unfreeze step
         for p in self.text_params:
             p.requires_grad = False
         for p in self.vit_params:
@@ -261,16 +230,10 @@ class MultiModalTrainer:
         for p in self.vit_lora_params:
             p.requires_grad = True
         
-        
-
-        # -----------------------------------------------------
-        #  4) Multiple OneCycle schedulers
-        # -----------------------------------------------------
         total_steps_per_epoch = len(self.tv_dataloader)
         self.steps_per_epoch = total_steps_per_epoch
         self.total_updates = (total_steps_per_epoch * num_epochs) // self.gradient_accumulation_steps
 
-        # We want "others" to run from 0 to self.total_updates
         self.sched_others = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_others,
             max_lr=learning_rate,
@@ -280,7 +243,6 @@ class MultiModalTrainer:
             final_div_factor=1e4,
             anneal_strategy='cos'
         )
-        # Scheduler for text: starts after unfreeze_text_step
         text_cycle = max(1, self.total_updates - unfreeze_text_step)
         self.sched_text = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_text,
@@ -291,7 +253,6 @@ class MultiModalTrainer:
             final_div_factor=1e4,
             anneal_strategy='cos'
         )
-        # Scheduler for vision (LoRA)
         vit_cycle = max(1, self.total_updates - unfreeze_vit_step)
         self.sched_vit = torch.optim.lr_scheduler.OneCycleLR(
             self.opt_vit,
@@ -303,14 +264,9 @@ class MultiModalTrainer:
             anneal_strategy='cos'
         )
 
-        # Local step counters for each scheduler
         self.step_others = 0
         self.step_text = 0
         self.step_vit = 0
-
-        # -----------------------------------------------------
-        #  5) State tracking & optional resume
-        # -----------------------------------------------------
         self.start_epoch = 0
         self.global_step = 0
         self.current_batch_idx = 0
@@ -331,9 +287,6 @@ class MultiModalTrainer:
         if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, name="Duod-256-bothlora-nonorm-hardmax-tempbound-gradclip2", config=self.config)
 
-        # -----------------------------------------------------
-        #  6) Visualization: Only text-visual
-        # -----------------------------------------------------
         self.text_viz = TextVisualizer()
         self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
 
@@ -352,10 +305,6 @@ class MultiModalTrainer:
         print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
         self.logger.info("Initialized MultiModalTrainer for text-visual training.")
 
-
-    ###########################################
-    #     Checkpointing Helpers
-    ###########################################
     def find_latest_checkpoint(self):
         ckpts = list(self.output_dir.glob("checkpoint_epoch*_step*.pt"))
         if not ckpts:
@@ -472,9 +421,6 @@ class MultiModalTrainer:
         else:
             self.model.tau = 0.05'''
 
-    ###########################################
-    #  Freeze/Unfreeze logic (Text Only)
-    ###########################################
     def _update_frozen_params(self, current_step: int):
         pass
 
@@ -499,12 +445,9 @@ class MultiModalTrainer:
     #     Visualization logic (Text-Visual)
     ###########################################
     def _get_tv_vis_samples(self, n_samples=2, use_val=False):
-        """Get clean samples for text-visualization without augmentation"""
+        
         dataset = self.val_tv_dataset if use_val and self.val_tv_dataset else self.tv_dataset
-        
-        # Use dataset's clean transform for consistent visualization
         clean_transform = dataset.clean_transform
-        
         batch_dataloader = DataLoader(
             dataset,
             batch_size=n_samples,
@@ -534,7 +477,6 @@ class MultiModalTrainer:
         }
 
     def visualize_samples(self, epoch):
-        """Generate text-visualizations for the current epoch."""
         self.logger.info(f"Generating text visualization for epoch: {epoch}")
         self.model.eval()
         with torch.no_grad():
@@ -565,14 +507,8 @@ class MultiModalTrainer:
         plt.close('all')
         gc.collect()
 
-    ###########################################
-    #           Validation Method (Text-Visual)
-    ###########################################
     def validate(self, phase=None):
-        """
-        Evaluate model on the text-visual validation dataset.
-        Returns the overall text loss and total validation loss.
-        """
+
         if phase is None:
             phase = "text"
                 
@@ -603,12 +539,9 @@ class MultiModalTrainer:
                     if key not in stats:
                         continue
                     v = stats[key]
-                    # if it's a Tensor, move to CPU and get Python scalar
                     if isinstance(v, torch.Tensor):
                         v = v.detach().cpu().item()
-                    # otherwise assume it's already a number
                     vals.append(v)
-                # now compute numpy mean over a list of floats
                 avg_tv_sim_stats[f"val_{key}"] = np.mean(vals)
         
         if self.use_wandb:
@@ -633,10 +566,9 @@ class MultiModalTrainer:
         print(f"Time taken to compile model: {end_time - start_time:.2f} seconds")
         return None, avg_tv_loss, val_total_loss
     
-
     def eval_1000_way_retrieval(self):
         """
-        1000-way retrieval for text-visual subset.
+        1000-way ret
         """
         if not self.val_tv_dataset:
             self.logger.info("No 1000-way retrieval possible, no validation set loaded.")
@@ -661,9 +593,7 @@ class MultiModalTrainer:
         self.model.train()
         self.logger.info("Done 1000-way retrieval evaluation.")
 
-    ###########################################
-    #           Main Training Loop
-    ###########################################
+
     def train(self):
         accumulation_counter = 0
         #wandb.watch(self.model, log="all")
@@ -677,7 +607,6 @@ class MultiModalTrainer:
             np.random.seed(42 + epoch + self.global_step)
 
             epoch_losses = []
-            # Print trainable parameter stats
             total_params = 0
             trainable_params = 0
             trainable_layers = []
@@ -692,25 +621,22 @@ class MultiModalTrainer:
             print(f"\nTrainable parameters: {trainable_params:,} / {total_params:,} "
                   f"({100 * trainable_params / total_params:.2f}%)")
             print(f"Trainable layers:\n" + "\n".join(trainable_layers) + "\n")
-            # Create a clone of the model's state before training
             prev_state = {name: param.clone().detach() for name, param in self.model.named_parameters()}
             
             print(f"Resuming from batch {self.current_batch_idx}")
             pbar = tqdm(enumerate(self.tv_dataloader), desc=f"Epoch {epoch} ({phase})", total=len(self.tv_dataloader))
             for batch_idx, tv_batch in pbar:
-                # Skip batches for checkpoint resume
                 if batch_idx < self.current_batch_idx:
                     continue
                 self._update_frozen_params(self.global_step)
                 #self.anneal_tau(self.global_step)
-                
-                # After first batch, check which layers were updated
+        
                 if batch_idx == 20:
                     print("\nLayers updated after first batch:")
                     for name, param in self.model.named_parameters():
                         if not torch.equal(param.data, prev_state[name]):
                             print(f"- {name}")
-                    print() # Empty line for readability
+                    print() 
                 grad_norm_text = None
                 grad_norm_text_lora = None
                 grad_norm_vit = None
@@ -769,7 +695,6 @@ class MultiModalTrainer:
                     #clip_grad_norm_(self.model.text_embedder.parameters(), 1.0)
                     #clip_grad_norm_(self.model.visual_embedder.parameters(), 1.0)
                     clip_grad_norm_(self.model.parameters(), 2.0)
-                    # Step each optimizer
                     self.opt_others.step()
                     self.opt_others.zero_grad()
                     if self.step_others < self.total_updates:
@@ -873,13 +798,11 @@ class MultiModalTrainer:
         self.logger.info("Training complete!")
 
 
-###########################################
-#        Main Script
-###########################################
+
 if __name__ == "__main__":
     print("Starting text-visual training...")
 
-    trainer = MultiModalTrainer(
+    trainer = DuoDTrainer(
         text_dataset_path="/home/cis/cc3m-ironic",
         text_dataset_val_path="/home/cis/cc3m-ironic-val",
         output_dir="./outputs-bothlora-nonorm-infonce-hardmax-tempbound",

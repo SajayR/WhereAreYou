@@ -7,17 +7,12 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm  
 
 def select_subset_indices(dataset, subset_file, subset_size=1000):
-    """
-    Attempt to read subset indices from `subset_file`.
-    If it doesn't exist, sample a random subset of size `subset_size`,
-    write them, and return them.
-    """
     import os
     import random
 
     if os.path.exists(subset_file):
         with open(subset_file, 'r') as f:
-            indices = json.load(f)  # e.g. a list of ints
+            indices = json.load(f)  # list of ints
         print(f"Loaded {len(indices)} subset indices from {subset_file}")
         return indices
     else:
@@ -33,20 +28,18 @@ def compute_recall_at_k(sim_matrix):
     """
     Given NxN sim_matrix, where sim_matrix[i,j] is the similarity
     of query i to item j, the correct match is j=i.
-    We'll compute R@1, R@5, R@10, R@20.
+    R@1, R@5, R@10, R@20.
 
-    Returns: dict with {'r1':..., 'r5':..., 'r10':..., 'r20':...}
+    Returns: {'r1':..., 'r5':..., 'r10':..., 'r20':...}
     """
     N = sim_matrix.shape[0]
     ranks = []
     for i in range(N):
         row = sim_matrix[i]
-        # Sort in descending order
         sorted_indices = np.argsort(-row)
         rank_of_correct = np.where(sorted_indices == i)[0][0]  # 0-based
         ranks.append(rank_of_correct)
     ranks = np.array(ranks)
-    # Compute recall
     r1  = np.mean(ranks < 1)
     r5  = np.mean(ranks < 5)
     r10 = np.mean(ranks < 10)
@@ -58,9 +51,8 @@ def compute_recall_at_k(sim_matrix):
         'r20': r20
     }
 
-# --------------------------------------------------------------------------- #
+
 # For Text->Visual retrieval:
-# --------------------------------------------------------------------------- #
 def aggregator_tv_t2v(t_feats, v_feats, temperature):
     token_sims = torch.matmul(t_feats, v_feats.t()) *temperature   
     max_sims = token_sims.max(dim=1).values
@@ -73,8 +65,7 @@ def aggregator_tv_v2t(t_feats, v_feats, temperature):
 
 def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8):
     """
-    Extract text and image embeddings for the 1000 chosen items in dataset.
-    We'll do a small subset DataLoader, no augmentation, etc.
+    text and image embeddings for the 1000 chosen items in dataset.
     Returns:
         text_feats_list[i]: (Nt_i, D)
         image_feats_list[i]: (Ni_i, D)
@@ -96,7 +87,6 @@ def embed_tv_subset(model, dataset, subset_indices, device='cuda', batch_size=8)
             return len(self.indices)
         def __getitem__(self, idx):
             real_idx = self.indices[idx]
-            # This returns (image, caption), no random transforms
             return self.base.__getitem__(real_idx)
 
     subset_ds = TVSubset(dataset, subset_indices)

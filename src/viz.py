@@ -1,14 +1,4 @@
-# viz.py (refined)
 
-"""
-Improved text‑visual attention visualiser with:
-* ground‑truth frame first
-* word‑level averaged heat‑maps
-* caption under each cell, attended word in **red**
-* layout fixes so captions are always visible
-
-Drop‑in replacement – same public API.
-"""
 import textwrap
 from matplotlib.gridspec import GridSpec
 import torch
@@ -20,23 +10,16 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from typing import List, Tuple
 
-###############################################################################
-# Helper utilities
-###############################################################################
 
 _DEF_MEAN = np.array([0.485, 0.456, 0.406]).reshape(1, 1, 3)
 _DEF_STD = np.array([0.229, 0.224, 0.225]).reshape(1, 1, 3)
 
 
 def denorm(img: torch.Tensor) -> np.ndarray:
-    """ImageNet‑denormalise and to uint8 HWC."""
     np_img = img.permute(1, 2, 0).cpu().numpy()
     np_img = (np_img * _DEF_STD + _DEF_MEAN) * 255
     return np.clip(np_img, 0, 255).astype(np.uint8)
 
-###############################################################################
-# Text visualiser
-###############################################################################
 
 class TextVisualizer:
     def __init__(self, patch_size: int = 14, image_size: int = 224):
@@ -51,9 +34,6 @@ class TextVisualizer:
         ]
         self.cmap = LinearSegmentedColormap.from_list("custom", colors)
 
-    # --------------------------------------------------------------------- #
-    # Internal helpers
-    # --------------------------------------------------------------------- #
     def _patches_to_heatmaps(self, patch_att: torch.Tensor) -> torch.Tensor:
         n, _ = patch_att.shape
         patches = patch_att.reshape(n, self.num_patches, self.num_patches)
@@ -92,12 +72,6 @@ class TextVisualizer:
         heat_rgb = (self.cmap(heat)[..., :3] * 255).astype(np.uint8)
         return ((1 - alpha) * img + alpha * heat_rgb).astype(np.uint8)
 
-    # --------------------------------------------------------------------- #
-    # Caption drawing – split into 3 text objects so we can colour the word
-    # --------------------------------------------------------------------- #
-    ###############################################################################
-# Caption drawing helper (signature extended)
-###############################################################################
     @staticmethod
     def _draw_caption(ax, full: str, word: str,
                       max_chars: int = 45, font_size: int = 14):
@@ -115,8 +89,6 @@ class TextVisualizer:
         from PIL import Image, ImageDraw, ImageFont
         import numpy as np
         import re, textwrap
-
-        # pick a widely‑available sans‑serif font or fall back
         for fname in ["Arial", "DejaVuSans", "FreeSans", "LiberationSans"]:
             try:
                 font = ImageFont.truetype(fname, font_size)
@@ -128,7 +100,6 @@ class TextVisualizer:
 
         lines = textwrap.wrap(full, max_chars)
 
-        # helper to measure text reliably across Pillow versions
         def text_dims(txt: str):
             try:
                 w, h = font.getbbox(txt)[2:]
@@ -150,20 +121,14 @@ class TextVisualizer:
             cur = 0
             for m in re.finditer(pattern, line, re.IGNORECASE):
                 s, e = m.span()
-
-                # text before the match
                 if s > cur:
                     seg = line[cur:s]
                     draw.text((x, y), seg, fill=(0, 0, 0), font=font)
                     x += text_dims(seg)[0]
-
-                # the highlighted match
                 seg = line[s:e]
                 draw.text((x, y), seg, fill=(255, 0, 0), font=font)
                 x += text_dims(seg)[0]
                 cur = e
-
-            # remainder of the line
             if cur < len(line):
                 seg = line[cur:]
                 draw.text((x, y), seg, fill=(0, 0, 0), font=font)
@@ -173,20 +138,14 @@ class TextVisualizer:
         ax.imshow(np.asarray(img))
         ax.axis("off")
 
-###############################################################################
-# Public API – updated to enforce uniform cell size
-###############################################################################
     def plot_token_attentions(self, model, frame, text,
                               output_path: str | None = None,
                               dpi: int = 300):
-        # ------------------------------------------------------------ #
-        # Tunable layout constants (change here to tweak look‑and‑feel)
-        # ------------------------------------------------------------ #
+
         CAP_FONT_SIZE = 18  # pt
         CAP_WRAP      = 45   # chars/line
         IMG_RATIO     = 5.0  # relative height of an image row
         LINE_RATIO    = 0.28 # reslative height contribution per caption line
-        # ------------------------------------------------------------ #
 
         model.eval()
         with torch.no_grad():
@@ -209,19 +168,16 @@ class TextVisualizer:
         word_maps = self._merge(self._patches_to_heatmaps(sims), groups)
         img_np    = denorm(frame)
 
-        n_cells = len(words) + 1           # +1 for the ground‑truth panel
+        n_cells = len(words) + 1           
         cols    = min(4, n_cells)
         rows    = (n_cells + cols - 1) // cols
 
-        # ---------- determine uniform caption height ---------------- #
         import textwrap
         line_counts = [len(textwrap.wrap(text, CAP_WRAP))]      # GT caption
         line_counts += [len(textwrap.wrap(text, CAP_WRAP))
                         for _ in words]                         # every word
         max_lines   = max(line_counts)
         cap_ratio   = max_lines * LINE_RATIO
-
-        # ---------- build the figure/grid --------------------------- #
         from matplotlib.gridspec import GridSpec
         fig_h = (IMG_RATIO + cap_ratio) * rows * 1.1
         fig   = plt.figure(figsize=(4.8 * cols, fig_h),
@@ -233,14 +189,11 @@ class TextVisualizer:
 
         def panel(r, c):
             return fig.add_subplot(gs[r, c])
-
-        # ----- ground truth ----------------------------------------- #
         ax_img = panel(0, 0)
         ax_img.imshow(img_np);  ax_img.axis("off")
         ax_img.set_title("Ground truth", pad=4)
-        panel(1, 0).axis("off")   # blank caption keeps grid tidy
+        panel(1, 0).axis("off")  
 
-        # ----- attention overlays ----------------------------------- #
         for k, (w, hmap) in enumerate(zip(words, word_maps), start=1):
             r, c = divmod(k, cols)
             ax_img = panel(2 * r,     c)
@@ -254,7 +207,6 @@ class TextVisualizer:
                                max_chars=CAP_WRAP,
                                font_size=CAP_FONT_SIZE)
 
-        # ----- save / show ------------------------------------------ #
         if output_path:
             fig.savefig(output_path, bbox_inches="tight", dpi=dpi)
             plt.close(fig)
