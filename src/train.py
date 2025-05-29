@@ -69,7 +69,8 @@ class DuoDTrainer:
         vit_lora_rank: int = 16,
         vit_lora_alpha: int = 32,
         text_lora_rank: int = 16,
-        text_lora_alpha: int = 32
+        text_lora_alpha: int = 32,
+        weights_only_checkpoint_path: str = None
     ):
         """
         Args:
@@ -91,6 +92,7 @@ class DuoDTrainer:
             force_new_training:     if True, starts a new training run (ignores checkpoints)
             text_dataset_val_path:  path for validation LocalCaptionDataset (optional)
             validation_frequency:   frequency (in steps) for validation
+            weights_only_checkpoint_path: path to a checkpoint to load only model weights from (optional)
         """
         self.device = device
         self.output_dir = Path(output_dir)
@@ -102,6 +104,8 @@ class DuoDTrainer:
         self.save_every_steps = save_every_steps
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.validation_frequency = validation_frequency
+        self.weights_only_checkpoint_path = weights_only_checkpoint_path
+        self.num_vis_samples_tv = num_vis_samples_tv
 
         self.config = {
             "batch_size_tv": batch_size_tv,
@@ -112,7 +116,12 @@ class DuoDTrainer:
             "unfreeze_vit_step": unfreeze_vit_step,
             "vis_every": vis_every,
             "save_every_steps": save_every_steps,
-            "validation_frequency": validation_frequency
+            "validation_frequency": validation_frequency,
+            "weights_only_checkpoint_path": self.weights_only_checkpoint_path,
+            "vit_lora_rank": vit_lora_rank,
+            "vit_lora_alpha": vit_lora_alpha,
+            "text_lora_rank": text_lora_rank,
+            "text_lora_alpha": text_lora_alpha
         }
         logging.basicConfig(
             filename=str(self.output_dir / 'training.log'),
@@ -260,24 +269,40 @@ class DuoDTrainer:
         self.current_batch_idx = 0
         self.best_loss = float('inf')
 
-        print("Force new training: ", force_new_training)
-        print("Use wandb: ", self.use_wandb)
-        if not force_new_training:
-            print("Loading checkpoint")
-            ckpt = self.find_latest_checkpoint()
-            print("Checkpoint found: ", ckpt)
-            if ckpt:
-                self.load_checkpoint(ckpt)
-                print("Checkpoint loaded")
-            elif self.use_wandb:
-                print("No checkpoint found")
-        
+        self.vis_samples_tv = None # Initialize to None
+
+        self.logger.info(f"Force new training: {force_new_training}")
+        self.logger.info(f"Weights-only checkpoint path: {self.weights_only_checkpoint_path}")
+
+        if self.weights_only_checkpoint_path:
+            self.logger.info(f"Attempting to load weights ONLY from: {self.weights_only_checkpoint_path}")
+            if Path(self.weights_only_checkpoint_path).exists():
+                self.load_checkpoint(self.weights_only_checkpoint_path, weights_only=True)
+                # Note: self.vis_samples_tv will be None here, will be initialized after this block
+            else:
+                self.logger.error(f"Specified weights-only checkpoint not found: {self.weights_only_checkpoint_path}. Training will start with fresh weights and states.")
+        elif not force_new_training:
+            self.logger.info("Attempting to load latest checkpoint for full training continuation...")
+            ckpt_path = self.find_latest_checkpoint()
+            if ckpt_path:
+                self.logger.info(f"Found latest checkpoint: {ckpt_path}")
+                self.load_checkpoint(ckpt_path, weights_only=False)
+                # self.vis_samples_tv should be loaded by load_checkpoint if present
+            else:
+                self.logger.info("No suitable checkpoint found for full continuation. Training will start fresh.")
+        else:
+            self.logger.info("`force_new_training` is True or no other checkpoint loading options were applicable. Training will start fresh.")
+
         if self.use_wandb and wandb.run is None:
             wandb.init(project=self.project_name, name=run_name, config=self.config)
 
         self.text_viz = TextVisualizer()
-        self.vis_samples_tv = self._get_tv_vis_samples(num_vis_samples_tv, use_val=bool(self.val_tv_dataset))
-
+        if self.vis_samples_tv is None: # Initialize if not loaded from a full checkpoint
+            self.logger.info(f"Initializing visualization samples ({self.num_vis_samples_tv} samples).")
+            self.vis_samples_tv = self._get_tv_vis_samples(
+                n_samples=self.num_vis_samples_tv,
+                use_val=bool(self.val_tv_dataset)
+            )
 
     def find_latest_checkpoint(self):
         ckpts = list(self.output_dir.glob("checkpoint_epoch*_step*.pt"))
@@ -325,52 +350,95 @@ class DuoDTrainer:
             torch.save(ckpt, best_path)
             self.logger.info(f"Saved best model checkpoint: {best_path}")
 
-    def load_checkpoint(self, ckpt_path):
-        self.logger.info(f"Loading checkpoint from {ckpt_path}")
-        ck = torch.load(ckpt_path, map_location=self.device, weights_only=False)
-        if "_orig_mod." in list(ck["model_state_dict"].keys())[0]:
-            print("Checkpoint with _orig_mod. found")
-            state_dict = ck["model_state_dict"]
-            clean_state_dict = {}
-            for key, value in state_dict.items():
-                if key.startswith('_orig_mod.'):
-                    clean_key = key[len('_orig_mod.'):]
-                    clean_state_dict[clean_key] = value
-                else:
-                    clean_state_dict[key] = value
-            self.model.load_state_dict(clean_state_dict)
+    def load_checkpoint(self, ckpt_path, weights_only=False):
+        self.logger.info(f"Loading checkpoint from {ckpt_path}{' (weights only)' if weights_only else ''}")
+        try:
+            ck = torch.load(ckpt_path, map_location=self.device, weights_only=False) # torch.load's weights_only is about file metadata
+        except FileNotFoundError:
+            self.logger.error(f"Checkpoint file not found: {ckpt_path}")
+            return
+        except Exception as e:
+            self.logger.error(f"Error loading checkpoint {ckpt_path}: {e}")
+            return
+
+        model_state_dict = ck.get("model_state_dict")
+        if model_state_dict:
+            # Handle potential '_orig_mod.' prefix if model was compiled
+            if list(model_state_dict.keys())[0].startswith('_orig_mod.'):
+                self.logger.info("Checkpoint contains keys with '_orig_mod.' prefix, stripping prefix.")
+                clean_state_dict = {k[len('_orig_mod.'):]: v for k, v in model_state_dict.items() if k.startswith('_orig_mod.')}
+                # Add other keys that might not have the prefix (e.g. LoRA weights if not part of compiled module)
+                for k, v in model_state_dict.items():
+                    if not k.startswith('_orig_mod.'):
+                        clean_state_dict[k] = v
+                self.model.load_state_dict(clean_state_dict)
+            else:
+                self.model.load_state_dict(model_state_dict)
+            self.logger.info(f"Model weights loaded from {ckpt_path}")
         else:
-            self.model.load_state_dict(ck["model_state_dict"])
-        self.optimizer.load_state_dict(ck["optimizer_state"])
-        self.scheduler.load_state_dict(ck["scheduler_state"])
-        self.scheduler_step_count = ck.get("scheduler_step_count", 0)
-        self.start_epoch = ck["epoch"]
-        self.global_step = ck["step"] #+1 because we already did one step in the main loop
-        self.current_batch_idx = ck.get("current_batch_idx", 0)
-        self.best_loss = ck["best_loss"]
-        rng_state = ck.get("rng_state", None)
-        if rng_state is not None:
-            torch_state = rng_state["torch"]
-            if not isinstance(torch_state, torch.Tensor):
-                torch_state = torch.tensor(torch_state, dtype=torch.uint8)
-            torch.set_rng_state(torch_state.cpu())
+            self.logger.error(f"'model_state_dict' not found in checkpoint {ckpt_path}. Cannot load model weights.")
+            # If we can't load weights, there's little point proceeding further with this checkpoint.
+            del ck
+            gc.collect()
+            return
 
-            for i, cuda_state in enumerate(rng_state["cuda"]):
-                if not isinstance(cuda_state, torch.Tensor):
-                    cuda_state = torch.tensor(cuda_state, dtype=torch.uint8)
-                torch.cuda.set_rng_state(cuda_state.cpu(), device=i)
+        if not weights_only:
+            self.logger.info(f"Loading full training state from {ckpt_path}.")
+            # Load optimizer and scheduler states if they exist
+            if "optimizer_state" in ck:
+                self.optimizer.load_state_dict(ck["optimizer_state"])
+            else:
+                self.logger.warning(f"'optimizer_state' not found in {ckpt_path}. Optimizer not loaded.")
+            
+            if "scheduler_state" in ck:
+                self.scheduler.load_state_dict(ck["scheduler_state"])
+            else:
+                self.logger.warning(f"'scheduler_state' not found in {ckpt_path}. Scheduler not loaded.")
 
-            np.random.set_state(rng_state["numpy"])
-            random.setstate(rng_state["python"])
+            self.scheduler_step_count = ck.get("scheduler_step_count", self.scheduler_step_count)
+            self.start_epoch = ck.get("epoch", self.start_epoch)
+            self.global_step = ck.get("step", self.global_step)
+            self.current_batch_idx = ck.get("current_batch_idx", self.current_batch_idx)
+            self.best_loss = ck.get("best_loss", self.best_loss)
 
-        self.vis_samples_tv = ck["vis_samples_tv"]
-        self.best_loss = ck["best_loss"]
+            rng_state = ck.get("rng_state")
+            if rng_state:
+                torch_state = rng_state.get("torch")
+                if torch_state is not None:
+                    torch.set_rng_state(torch.ByteTensor(torch_state) if not isinstance(torch_state, torch.Tensor) else torch_state.cpu())
+                
+                cuda_states = rng_state.get("cuda")
+                if cuda_states:
+                    for i, cuda_state in enumerate(cuda_states):
+                        if i < torch.cuda.device_count(): # Ensure device index is valid
+                            torch.cuda.set_rng_state(torch.ByteTensor(cuda_state) if not isinstance(cuda_state, torch.Tensor) else cuda_state.cpu(), device=i)
+                
+                numpy_state = rng_state.get("numpy")
+                if numpy_state is not None:
+                    np.random.set_state(numpy_state)
+                
+                python_state = rng_state.get("python")
+                if python_state is not None:
+                    random.setstate(python_state)
+            else:
+                self.logger.warning(f"'rng_state' not found in {ckpt_path}. RNG states not restored.")
+
+            # Load visualization samples if present in the checkpoint
+            loaded_vis_samples = ck.get("vis_samples_tv")
+            if loaded_vis_samples is not None:
+                self.vis_samples_tv = loaded_vis_samples
+                self.logger.info(f"Loaded 'vis_samples_tv' from {ckpt_path}.")
+            else:
+                self.logger.info(f"'vis_samples_tv' not found in {ckpt_path}. Will be initialized if needed.")
+            
+            self.logger.info(
+                f"Full training state loaded from {ckpt_path} (epoch={self.start_epoch}, step={self.global_step}, batch_idx={self.current_batch_idx})"
+            )
+        else:
+            self.logger.info(f"Weights loaded from {ckpt_path}. Optimizer, scheduler, and other training states are fresh.")
+
         del ck
-
-        self.logger.info(
-            f"Checkpoint loaded (epoch={self.start_epoch}, step={self.global_step}, "
-            f"batch_offset={self.current_batch_idx})"
-        )
+        gc.collect()
 
     def _get_tv_vis_samples(self, n_samples=2, use_val=False):
         
@@ -692,11 +760,13 @@ if __name__ == "__main__":
     parser.add_argument("--text_lora_alpha",type=int, default=32)
     # training knobs
     parser.add_argument("--num_epochs",     type=int, default=10)
-    parser.add_argument("--learning_rate",  type=float,default=1e-3)
+    parser.add_argument("--learning_rate",  type=float,default=1e-4)
     parser.add_argument("--batch_size_tv",  type=int, default=64)
     # misc
     parser.add_argument("--force_new", action="store_true",
                         help="Start fresh, ignore any checkpoints in output_dir")
+    parser.add_argument("--weights_only_checkpoint_path", type=str, default=None,
+                        help="Path to a checkpoint to load only model weights from (ignores optimizer, scheduler, etc.)")
 
     args = parser.parse_args()
 
@@ -708,7 +778,7 @@ if __name__ == "__main__":
         #    f"./runs/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
         #)
         args.output_dir = (
-            f"./temp_run_with_norm/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
+            f"./temp_run_without_norm/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
         )
 
     trainer = DuoDTrainer(
@@ -736,7 +806,7 @@ if __name__ == "__main__":
         num_vis_samples_tv=64,
         use_amp=True,
         validation_frequency=20000,
-        
+        weights_only_checkpoint_path=args.weights_only_checkpoint_path,
     )
 
     trainer.train()
