@@ -78,7 +78,7 @@ class TextEmbedder(nn.Module):
         outputs = self.encoder(**inputs)  # (B, Nt, hidden_size)
         hidden_states = outputs.last_hidden_state
         text_feats = self.projection2(self.layer_norm(self.projection1(hidden_states)))  # (B, Nt, D)
-        
+        text_feats = F.normalize(text_feats, dim=-1)
         return text_feats, inputs["attention_mask"]
 
 class ViTEmbedder(nn.Module):
@@ -179,14 +179,13 @@ class ViTEmbedder(nn.Module):
         #print("patches", patches.shape)
         feats = self.projection2(self.layer_norm(self.projection1(patches)))
         feats = self.patch_dropout(feats, self.patch_dropout_rate)
-        
+        feats = F.normalize(feats, dim=-1)
         return feats
 
 class DuoDModel(nn.Module):
     def __init__(
         self, 
         text_model_name="distilbert/distilbert-base-uncased",
-        temperature=1.2,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
         visual_dropout_prob=0.1,
@@ -201,7 +200,7 @@ class DuoDModel(nn.Module):
         self.visual_embedder = ViTEmbedder(arch='dinov2_vitb14_reg', embedding_dim=256, dropout_prob=visual_dropout_prob, lora_rank=vit_lora_rank, lora_alpha=vit_lora_alpha)
         self.text_embedder = TextEmbedder(embedding_dim=256, model_name=text_model_name, lora_rank=text_lora_rank, lora_alpha=text_lora_alpha)
 
-        self.temperature = nn.Parameter(torch.tensor(temperature))
+        self.logit_scale = nn.Parameter(torch.tensor(math.log(1 / 0.07)))
         self.patch_sparsity_threshold = patch_sparsity_threshold
         self.patch_sparsity_weight = patch_sparsity_weight
         self.use_amp = use_amp
@@ -222,7 +221,7 @@ class DuoDModel(nn.Module):
         feats2_f32 = feats2.float()
         with torch.cuda.amp.autocast(enabled=False):
             sim = torch.bmm(feats1_f32, feats2_f32.transpose(1, 2))
-            return (sim * self.temperature.float()).float()
+            return (sim * torch.exp(self.logit_scale.float())).float()
 
 
     def compute_all_similarities_tv(self,
@@ -255,7 +254,7 @@ class DuoDModel(nn.Module):
 
         # Full token-level similarity tensor
         token_sims = torch.matmul(tf, vf.transpose(2, 3))           # (B, B, Nt, Nv)
-        token_sims = token_sims * self.temperature                   # scale by learned temp
+        token_sims = token_sims * torch.exp(self.logit_scale)       # scale by learned temp
 
         # ------------------------------------------------------------
         # 1)  text → visual • max over patches, mean over tokens
@@ -283,13 +282,7 @@ class DuoDModel(nn.Module):
         # negative clamp
         neg_sims = torch.clamp(token_sims, min=-20, max=0)
         l_nonneg = torch.mean(neg_sims**2)
-        #temp constraints
-        temp = self.temperature
-        temp_low = torch.clamp(torch.log(torch.tensor(1.0, device=token_sims.device)) 
-                               - torch.log(temp), min=0) ** 2
-        temp_high = torch.clamp(torch.log(temp) - torch.log(torch.tensor(2.0, device=token_sims.device)), min=0) ** 2
-        l_cal = temp_low + temp_high
-        return l_nonneg + 0.1*l_cal
+        return l_nonneg
 
         
     def compute_contrastive_loss_tv(self, clip_sims, token_sims): #infonce
@@ -354,7 +347,7 @@ class DuoDModel(nn.Module):
 
     def forward(self, frames=None, text_list=None):
         assert frames is not None or text_list is not None, "At least one modality must be provided"
-        assert frames is not str, "Frames Cross-modal retrieval using 1000 evaluation videos from the PlacesAudio and AudioSet validation datasets. DenseAV dramatically outperforms all approaches tested in all metrics. Most notably, the state-of-the-art image retrieval foundation model, ImageBind, is incapable of recognizing speech. We note that the ImageBind authors do not publish retraining code, so we evaluate their largest pretrained model. Models with a * indicate that they have been previously reported in the literature. Other numbers are calculated by using pretrained models when available or from training with the author’s official training scripts.should be a path to an image"
+        assert frames is not str, "Frames should be a tensor, not a file path string"
         if frames is not None:
             image = Image.open(frames).convert('RGB')
             transform = transforms.Compose([
@@ -380,10 +373,9 @@ if __name__ == "__main__":
     print("Testing MultiModalModel with random inputs...")
     model = DuoDModel(
         text_model_name="distilbert/distilbert-base-uncased",
-        temperature=2.0,
         patch_sparsity_threshold=0.3,
         patch_sparsity_weight=0.1,
-        visual_dropout_prob=0.2
+        visual_dropout_prob=0.2 
     ).to("cuda")
     batch_size = 2
     dummy_frames = torch.randn(batch_size, 3, 224, 224)      # image frames

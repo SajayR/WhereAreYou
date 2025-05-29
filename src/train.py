@@ -167,7 +167,7 @@ class DuoDTrainer:
 
         self.model = DuoDModel(
             text_model_name="distilbert/distilbert-base-uncased",
-            temperature=1.2,
+            #temperature=1.2,
             patch_sparsity_threshold=0.80,
             patch_sparsity_weight=0.00,
             visual_dropout_prob=0.10,
@@ -230,7 +230,7 @@ class DuoDTrainer:
             if "text_embedder.encoder" in name and "lora" in name:
                 print(f"  {name}")
 
-        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=learning_rate)
+        self.optimizer = torch.optim.AdamW(self.trainable_params, lr=learning_rate, weight_decay=0.001)
 
         # Set requires_grad for all parameters
         for p in self.base_text_params:
@@ -604,11 +604,14 @@ class DuoDTrainer:
                 if self.use_wandb:
                     wandb_dict = {
                         "train_loss": loss_val,
-                        #"loss_tv": tv_loss.item() if tv_loss is not None else 0.0,
+                        "lr": self.optimizer.param_groups[0]["lr"],
+                        #"grad_clip": self.grad_clip_val,
+                        "logit_scale": self.model.logit_scale.item(),
+                        "temperature": (1 / torch.exp(self.model.logit_scale)).item(),
+                        "loss": loss_val,
+                        "tv_loss": tv_loss.item() if tv_loss is not None else 0,
                         "epoch": epoch,
                         "global_step": self.global_step,
-                        "lr": self.optimizer.param_groups[0]['lr'],
-                        "temperature": self.model.temperature.item(),
                     }
                     
                     if grad_norm_trainable is not None:
@@ -681,14 +684,14 @@ if __name__ == "__main__":
     parser.add_argument("--text_dataset_val_path",  default="/home/cis/cc3m-ironic-val")
     parser.add_argument("--output_dir",             default=None,
                         help="Each sweep run should have its own dir.")
-    parser.add_argument("--run_name", type=str, default="Duod")
+    parser.add_argument("--run_name", type=str, default="Double-LoRA-l2norm-bothsides-godlikelongrun-weightdecay0.001-cliptemp")
     # LoRA sweep knobs
     parser.add_argument("--vit_lora_rank",  type=int, default=16)
     parser.add_argument("--vit_lora_alpha", type=int, default=32)
     parser.add_argument("--text_lora_rank", type=int, default=16)
     parser.add_argument("--text_lora_alpha",type=int, default=32)
     # training knobs
-    parser.add_argument("--num_epochs",     type=int, default=5)
+    parser.add_argument("--num_epochs",     type=int, default=10)
     parser.add_argument("--learning_rate",  type=float,default=1e-3)
     parser.add_argument("--batch_size_tv",  type=int, default=64)
     # misc
@@ -701,8 +704,11 @@ if __name__ == "__main__":
     # derive a *unique* output folder if the caller hasn't specified one
     # ./runs/rank{rank}_alpha{alpha}  (e.g. ./runs/rank32_alpha64)
     if args.output_dir is None:
+        #args.output_dir = (
+        #    f"./runs/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
+        #)
         args.output_dir = (
-            f"./runs/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
+            f"./temp_run_with_norm/rank{args.vit_lora_rank}_alpha{args.vit_lora_alpha}"
         )
 
     trainer = DuoDTrainer(
@@ -726,7 +732,7 @@ if __name__ == "__main__":
         gradient_accumulation_steps=4,
         unfreeze_text_step=0,
         unfreeze_vit_step=0,
-        project_name="Duod",
+        project_name="Triadisdead",
         num_vis_samples_tv=64,
         use_amp=True,
         validation_frequency=20000,

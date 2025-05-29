@@ -128,7 +128,7 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
     indices = select_subset_indices(dataset, subset_file, subset_size=1000)
     text_feats_list, image_feats_list = embed_tv_subset(model, dataset, indices, device=device, batch_size=32)
     N = len(indices)
-    temperature = model.temperature#.item()
+    scale_factor = torch.exp(model.logit_scale).item()
 
     # T->V
     print(f"Computing T->V retrieval on {N} items ...")
@@ -137,7 +137,7 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
         tfeats_i = text_feats_list[i].to(device)
         for j in range(N):
             vfeats_j = image_feats_list[j].to(device)
-            sim_mat_t2v[i, j] = aggregator_tv_t2v(tfeats_i, vfeats_j, temperature)
+            sim_mat_t2v[i, j] = aggregator_tv_t2v(tfeats_i, vfeats_j, scale_factor)
     tv_metrics = compute_recall_at_k(sim_mat_t2v)
 
     # V->T
@@ -147,7 +147,7 @@ def compute_tv_retrieval_metrics(model, dataset, subset_file, device='cuda'):
         vfeats_i = image_feats_list[i].to(device)
         for j in range(N):
             tfeats_j = text_feats_list[j].to(device)
-            sim_mat_v2t[i, j] = aggregator_tv_v2t(tfeats_j, vfeats_i, temperature)
+            sim_mat_v2t[i, j] = aggregator_tv_v2t(tfeats_j, vfeats_i, scale_factor)
     vt_metrics = compute_recall_at_k(sim_mat_v2t)
 
     results = {
